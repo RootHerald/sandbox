@@ -176,3 +176,458 @@ jobs:
           docker inspect rh-decoy-ctr > /dev/null
           docker network inspect rh-decoy-net > /dev/null
           docker volume inspect rh-decoy-vol > /dev/null
+
+  sdk-checksums:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: sdk/ matches sdk/SHA256SUMS, and each archive's own SHA256SUMS verifies without listing itself
+        run: |
+          set -euo pipefail
+          test -s sdk/SHA256SUMS || { echo "::error::sdk/SHA256SUMS is missing"; exit 1; }
+          cd sdk
+          sha256sum -c --strict --quiet SHA256SUMS
+          listed=$(awk '{print $2}' SHA256SUMS | sed 's|^\*||; s|^\./||' | LC_ALL=C sort)
+          present=$(find . -type f ! -path ./SHA256SUMS | sed 's|^\./||' | LC_ALL=C sort)
+          if ! diff <(echo "$listed") <(echo "$present"); then echo "::error::sdk/ and sdk/SHA256SUMS list different files"; exit 1; fi
+          for os in windows-x64 linux-x64; do
+            (
+              cd "$os"
+              sha256sum -c --strict --quiet SHA256SUMS
+              if grep -q 'SHA256SUMS$' SHA256SUMS; then echo "::error::sdk/$os/SHA256SUMS lists itself"; exit 1; fi
+            )
+          done
+
+      - name: sdk/ holds the two archives at ABI 8.1 and no SDK source
+        run: |
+          set -euo pipefail
+          for f in windows-x64/lib/RootHerald.lib windows-x64/lib/RootHeraldd.lib windows-x64/lib/cmake/RootHerald/RootHeraldConfig.cmake \
+                   linux-x64/lib/librootherald.a linux-x64/lib/cmake/RootHerald/RootHeraldConfig.cmake; do
+            test -f "sdk/$f" || { echo "::error::sdk/$f is missing"; exit 1; }
+          done
+          if find sdk \( -name '*.c' -o -name '*.cpp' -o -name CMakeLists.txt -o -type d -name src \) | grep .; then
+            echo "::error::sdk/ holds SDK source"; exit 1
+          fi
+          cmp sdk/windows-x64/include/rootherald.h sdk/linux-x64/include/rootherald.h
+          grep -qE '^#define ROOTHERALD_ABI_VERSION_MAJOR 8$' sdk/linux-x64/include/rootherald.h
+          grep -qE '^#define ROOTHERALD_ABI_VERSION_MINOR 1$' sdk/linux-x64/include/rootherald.h
+
+      - name: The tree stays within the repository layout, and the client's build output and state are ignored
+        run: |
+          set -euo pipefail
+          git check-ignore -q client/out/x
+          git check-ignore -q client/state/x
+          layout='LICENSE|README\.md|\.gitignore|\.env\.example|compose\.yaml|\.github/workflows/ci\.yml|backend/[^/]+|client/(main\.c|platform\.h|platform_windows\.c|platform_linux\.c|CMakeLists\.txt|CMakePresets\.json|Dockerfile)|sdk/.+'
+          if git ls-files | grep -vxE "$layout"; then echo "::error::files outside the repository layout"; exit 1; fi
+
+  client-build-windows:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Visual Studio 2022 is installed
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -version "[17,18)" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "no Visual Studio 2022 with the C++ tools" }
+
+      - name: The README's Windows commands are the three this job runs
+        shell: bash
+        working-directory: .
+        run: |
+          set -euo pipefail
+          awk '/^#+ Run the client on Windows[[:space:]]*$/ { heading = 1; next }
+               heading && !fence && /^#/ { exit }
+               heading && /^```/ { if (fence) exit; fence = 1; next }
+               fence { print }' README.md | tr -d '\r' | sed '/^[[:space:]]*$/d' > "$RUNNER_TEMP/windows-block.txt"
+          cat "$RUNNER_TEMP/windows-block.txt"
+          printf '%s\n' 'cmake --preset windows' 'cmake --build --preset windows' '.\out\build\windows\Debug\sandbox-client.exe' > "$RUNNER_TEMP/windows-expected.txt"
+          if ! diff "$RUNNER_TEMP/windows-expected.txt" "$RUNNER_TEMP/windows-block.txt"; then
+            echo "::error::README.md has no 'Run the client on Windows' block with the three commands"; exit 1
+          fi
+
+      - name: CMakeLists.txt names no SDK file, library, include path or runtime setting
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s CMakeLists.txt
+          if grep -nEi 'sdk/|include_directories|link_directories|tss2|crypto|\btbs\b|bcrypt|\.lib\b|\.a\b|MSVC_RUNTIME|/MD' CMakeLists.txt; then
+            echo "::error::CMakeLists.txt names the SDK's internals"; exit 1
+          fi
+
+      - name: The README's configure and build, with every compiler and linker warning an error
+        run: |
+          $block = Get-Content "$env:RUNNER_TEMP\windows-block.txt"
+          Invoke-Expression "$($block[0]) -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DCMAKE_EXE_LINKER_FLAGS=/WX"
+          if ($LASTEXITCODE -ne 0) { throw "configure failed" }
+          Invoke-Expression $block[1]
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+          if (-not (Select-String -Quiet -SimpleMatch 'RootHeraldd.lib' -Path out\build\windows\sandbox-client.vcxproj)) {
+            throw "the Debug build does not link RootHeraldd.lib"
+          }
+
+      - name: The banner prints first, SANDBOX_URL is honoured, and an unreachable backend exits 1
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $run = (Get-Content "$env:RUNNER_TEMP\windows-block.txt")[2]
+          $env:SANDBOX_URL = 'http://127.0.0.1:9'
+          $out = @(Invoke-Expression $run | ForEach-Object { "$_" })
+          $code = $LASTEXITCODE
+          $out | Write-Output
+          if ($code -ne 1) { throw "exit $code, expected 1" }
+          if ($out[0] -notmatch '^RootHerald SDK: ABI 8\.1, library (\S+)$') { throw "first line is not the SDK banner: $($out[0])" }
+          if ($Matches[1] -like 'stub-*') { throw "the client links the stub library" }
+          if ($out[1] -ne 'Backend: http://127.0.0.1:9') { throw "second line: $($out[1])" }
+          if ($out[2] -notmatch '^State: .*client[/\\]state$') { throw "third line: $($out[2])" }
+          if ($out -match '^stopped at ') { throw "an unreachable backend is not a stop by the backend" }
+
+          Remove-Item Env:SANDBOX_URL
+          $out = @(Invoke-Expression $run | ForEach-Object { "$_" })
+          $out | Write-Output
+          $port = (Select-String -Path ..\compose.yaml -Pattern 'SANDBOX_PORT:-(\d+)').Matches[0].Groups[1].Value
+          if ($out[1] -ne "Backend: http://127.0.0.1:$port") { throw "default backend: $($out[1]), compose.yaml defaults to $port" }
+          if (Test-Path state\ak.blob) { throw "a failed run left state\ak.blob" }
+          exit 0
+
+  client-build-linux:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential cmake pkg-config libtss2-dev libssl-dev libcurl4-openssl-dev
+
+      - name: CMakeLists.txt names no SDK file, library, include path or runtime setting
+        run: |
+          set -euo pipefail
+          test -s CMakeLists.txt
+          if grep -nEi 'sdk/|include_directories|link_directories|tss2|crypto|\btbs\b|bcrypt|\.lib\b|\.a\b|MSVC_RUNTIME|/MD' CMakeLists.txt; then
+            echo "::error::CMakeLists.txt names the SDK's internals"; exit 1
+          fi
+
+      - name: The client source names no TPM kind, container, key or RootHerald URL
+        run: |
+          set -euo pipefail
+          ls main.c platform.h platform_linux.c platform_windows.c
+          if grep -nEi 'swtpm|emulat|docker|container|TSS2_|/dev/tpm' ./*.c ./*.h; then
+            echo "::error::the client source knows which TPM it reaches"; exit 1
+          fi
+          if grep -rnE 'rootherald\.io|https://|rh_sk_' .; then
+            echo "::error::the client names RootHerald or a key"; exit 1
+          fi
+
+      - name: The preset configure and build, with every compiler and linker warning an error
+        run: |
+          set -euo pipefail
+          cmake --preset linux -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DCMAKE_EXE_LINKER_FLAGS=-Wl,--fatal-warnings
+          cmake --build --preset linux
+          if strings out/build/linux/sandbox-client | grep -F rh_sk_; then echo "::error::the binary carries a key prefix"; exit 1; fi
+
+      - name: The banner prints first, SANDBOX_URL is honoured, and an unreachable backend exits 1
+        run: |
+          set -uo pipefail
+          set +e
+          SANDBOX_URL=http://127.0.0.1:9 ./out/build/linux/sandbox-client > "$RUNNER_TEMP/smoke.out"
+          code=$?
+          set -e
+          cat "$RUNNER_TEMP/smoke.out"
+          test "$code" = 1 || { echo "::error::exit $code, expected 1"; exit 1; }
+          grep -qxE 'RootHerald SDK: ABI 8\.1, library [^ ]+' <(sed -n 1p "$RUNNER_TEMP/smoke.out") || { echo "::error::first line is not the SDK banner"; exit 1; }
+          if sed -n 1p "$RUNNER_TEMP/smoke.out" | grep -q 'library stub-'; then echo "::error::the client links the stub library"; exit 1; fi
+          test "$(sed -n 2p "$RUNNER_TEMP/smoke.out")" = 'Backend: http://127.0.0.1:9'
+          sed -n 3p "$RUNNER_TEMP/smoke.out" | grep -qxE 'State: .*/client/state'
+          if grep -q '^stopped at ' "$RUNNER_TEMP/smoke.out"; then echo "::error::an unreachable backend is not a stop by the backend"; exit 1; fi
+
+          set +e
+          ./out/build/linux/sandbox-client > "$RUNNER_TEMP/default.out"
+          set -e
+          port=$(grep -oE 'SANDBOX_PORT:-[0-9]+' ../compose.yaml | head -n1 | cut -d- -f2)
+          test "$(sed -n 2p "$RUNNER_TEMP/default.out")" = "Backend: http://127.0.0.1:$port" || { echo "::error::the default backend is not compose.yaml's port $port"; exit 1; }
+
+  client-linux-swtpm:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      STUB_PORT: "47999"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: This runner has no TPM device, so the client's default TCTI chain lands on swtpm
+        run: |
+          if ls /dev/tpm* 2>/dev/null; then echo "::error::the runner has a TPM device"; exit 1; fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential cmake pkg-config libtss2-dev libssl-dev libcurl4-openssl-dev swtpm swtpm-tools tpm2-tools
+          npm ci --prefix backend
+
+      - name: Build the client
+        working-directory: client
+        run: |
+          set -euo pipefail
+          cmake --preset linux -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+          cmake --build --preset linux
+
+      - name: Scenario helpers
+        run: |
+          cat > "$RUNNER_TEMP/scenario.sh" <<'EOF'
+          set -euo pipefail
+          T=$RUNNER_TEMP
+          fail() { echo "::error::$*"; exit 1; }
+
+          start_swtpm() {
+            local dir=$1
+            if [ ! -f "$dir/tpm2-00.permall" ]; then
+              mkdir -p "$dir"
+              swtpm_setup --create-config-files skip-if-exist > /dev/null
+              swtpm_setup --tpm2 --tpmstate "$dir" --create-ek-cert > /dev/null
+            fi
+            swtpm socket --tpm2 --tpmstate "dir=$dir" --server type=tcp,port=2321 --ctrl type=tcp,port=2322 \
+              --flags not-need-init,startup-clear --daemon --pid file=/tmp/rh-swtpm.pid
+            for _ in $(seq 50); do
+              tpm2_getcap -T swtpm:host=127.0.0.1,port=2321 properties-fixed > /dev/null 2>&1 && return 0
+              sleep 0.2
+            done
+            fail "swtpm did not come up"
+          }
+          stop_swtpm() {
+            kill "$(cat /tmp/rh-swtpm.pid)"
+            while kill -0 "$(cat /tmp/rh-swtpm.pid)" 2>/dev/null; do sleep 0.1; done
+          }
+
+          start_stub() {
+            SANDBOX_STUB_PORT=$STUB_PORT SANDBOX_STUB_STATE="$T/stub-state.json" node backend/server.test.js >> "$T/stub.log" 2>> "$T/stub-stderr.log" &
+            echo $! > "$T/stub.pid"
+            for _ in $(seq 50); do
+              [ "$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$STUB_PORT/")" != 000 ] && return 0
+              sleep 0.2
+            done
+            fail "the stub did not come up"
+          }
+          stop_stub() {
+            kill -TERM "$(cat "$T/stub.pid")"
+            while kill -0 "$(cat "$T/stub.pid")" 2>/dev/null; do sleep 0.1; done
+          }
+
+          # start_backend <policy> [port]
+          start_backend() {
+            local port=${2:-47823}
+            ROOTHERALD_URL="http://127.0.0.1:$STUB_PORT" ROOTHERALD_SECRET_KEY="rh_sk_stub_$1" SANDBOX_PORT=$port \
+              node backend/server.js >> "$T/backend.log" 2>&1 &
+            echo $! > "$T/backend.pid"
+            echo "$port" > "$T/backend.port"
+            for _ in $(seq 50); do
+              [ "$(curl -s -o /dev/null -w '%{http_code}' -H "Host: localhost:$port" "http://127.0.0.1:$port/")" = 200 ] && return 0
+              sleep 0.2
+            done
+            fail "the backend did not come up"
+          }
+          stop_backend() {
+            kill "$(cat "$T/backend.pid")"
+            while kill -0 "$(cat "$T/backend.pid")" 2>/dev/null; do sleep 0.1; done
+          }
+
+          # run_client <name> [VAR=value ...] [-- client arguments]: output in $T/<name>.out, exit code in $T/<name>.code
+          run_client() {
+            local name=$1
+            shift
+            local vars=() args=()
+            while [ $# -gt 0 ] && [ "$1" != -- ]; do vars+=("$1"); shift; done
+            [ $# -gt 0 ] && shift
+            args=("$@")
+            set +e
+            (cd client && env "${vars[@]}" timeout 120 ./out/build/linux/sandbox-client "${args[@]}") > "$T/$name.out" 2> "$T/$name.err"
+            echo $? > "$T/$name.code"
+            set -e
+            echo "---- $name: exit $(cat "$T/$name.code")"
+            cat "$T/$name.out"
+          }
+          code() { cat "$T/$1.code"; }
+          routes() { grep -E '^  POST /' "$T/$1.out" | awk '{print $2}' | tr '\n' ' '; }
+          stub_calls() { grep -c "^stub $1 " "$T/stub.log" || true; }
+          events() { curl -sN --max-time 3 -H "Host: localhost:$1" "http://127.0.0.1:$1/events" || true; }
+          last_ueid() { events "$1" | grep -o '"verdict":{[^}]*}' | grep -o '"ueid":"[^"]*"' | tail -n1 | cut -d'"' -f4; }
+          fresh_state() { rm -rf client/state; }
+          no_state_files() { [ -z "$(find client/state -type f 2>/dev/null)" ]; }
+          EOF
+
+      - name: The stub serves without running a test, and holds no hand-written TPM crypto
+        run: |
+          . "$RUNNER_TEMP/scenario.sh"
+          if grep -nE 'createCipheriv|publicEncrypt|KDFa|node:crypto' backend/server.test.js; then fail "the stub does its own crypto"; fi
+          start_swtpm /tmp/rh-swtpm-a
+          start_stub
+          test "$(grep -c '^stub ready on ' "$T/stub.log")" = 1 || fail "no single ready line"
+          if grep -v '^stub ' "$T/stub.log"; then fail "serve mode printed something other than stub lines (a test ran?)"; fi
+
+      - name: "C17 backend unreachable: PreCheck runs, exit 1, nothing written"
+        run: |
+          . "$RUNNER_TEMP/scenario.sh"
+          fresh_state
+          run_client unreachable SANDBOX_URL=http://127.0.0.1:9
+          test "$(code unreachable)" = 1 || fail "exit $(code unreachable), expected 1"
+          grep -qE '^EK certificate: (present|absent)$' "$T/unreachable.out" || fail "no PreCheck line"
+          if grep -q '^stopped at ' "$T/unreachable.out"; then fail "an unreachable backend is not a stop by the backend"; fi
+          no_state_files || fail "state/ holds $(find client/state -type f)"
+
+      - name: "C11 refused enrollment: step 01's line, exit 2, nothing after, nothing written"
+        run: |
+          . "$RUNNER_TEMP/scenario.sh"
+          fresh_state
+          start_backend refuse
+          run_client refuse
+          stop_backend
+          test "$(code refuse)" = 2 || fail "exit $(code refuse), expected 2"
+          grep -qE '^  POST /enroll/begin  RootHerald refused: ek_chain_rejected' "$T/refuse.out" || fail "no refusal line"
+          grep -qx 'stopped at /enroll/begin' "$T/refuse.out" || fail "no stopped line"
+          if grep -E '^  POST /(attest|sign|decrypt)/' "$T/refuse.out"; then fail "a use case ran after the refusal"; fi
+          no_state_files || fail "state/ holds $(find client/state -type f)"
+
+      - name: "C12 allowed, fresh state: all four use cases, the software TPM is never shown as silicon"
+        run: |
+          . "$RUNNER_TEMP/scenario.sh"
+          fresh_state
+          start_backend allow
+          run_client allow
+          last_ueid 47823 > "$T/ueid-a"
+          stop_backend
+          test "$(code allow)" = 0 || fail "exit $(code allow), expected 0"
+          grep -qx 'EK certificate: present' "$T/allow.out" || fail "swtpm's EK certificate not seen"
+          expected="/enroll/begin /enroll/complete /attest/challenge /attest/verify /sign/challenge /sign/certify /sign/verify /decrypt/challenge /decrypt/certify /decrypt/verify "
+          test "$(routes allow)" = "$expected" || fail "routes: $(routes allow)"
+          grep -qE '^  POST /attest/verify  (pass|warn) — Software TPM, not genuine hardware, no maker vouches for this chip' "$T/allow.out" || fail "verify line"
+          grep -qx '  POST /sign/certify  sign key certified, not hardware-bound' "$T/allow.out" || fail "sign certify line"
+          grep -qx '  POST /decrypt/certify  decrypt key certified, not hardware-bound' "$T/allow.out" || fail "decrypt certify line"
+          grep -qx '  POST /sign/verify  signature verified' "$T/allow.out" || fail "signature not verified"
+          grep -qx '  POST /decrypt/verify  secret recovered' "$T/allow.out" || fail "secret not recovered"
+          test "$(stat -c '%a' client/state)" = 700 || fail "state/ is mode $(stat -c '%a' client/state)"
+          test "$(stat -c '%a' client/state/ak.blob)" = 600 || fail "ak.blob is mode $(stat -c '%a' client/state/ak.blob)"
+          test "$(ls -A client/state)" = ak.blob || fail "state/ holds $(ls -A client/state)"
+          test -n "$(cat "$T/ueid-a")" || fail "the backend's page shows no ueid"
+          cp client/state/ak.blob "$T/ak-swtpm-a.blob"
+
+      - name: "C13 second run on another port: enrollment skipped, same ueid"
+        run: |
+          . "$RUNNER_TEMP/scenario.sh"
+          enrolls=$(stub_calls /api/v1/attest/enroll)
+          start_backend allow 48111
+          run_client second SANDBOX_URL=http://127.0.0.1:48111
+          last_ueid 48111 > "$T/ueid-second"
+          stop_backend
+          test "$(code second)" = 0 || fail "exit $(code second), expected 0"
+          grep -qx 'Enrollment skipped: state/ak.blob loads' "$T/second.out" || fail "enrollment not skipped"
+          if grep -E '^  POST /enroll/' "$T/second.out"; then fail "the second run enrolled"; fi
+          test "$(stub_calls /api/v1/attest/enroll)" = "$enrolls" || fail "the stub saw an enrollment"
+          test "$(cat "$T/ueid-second")" = "$(cat "$T/ueid-a")" || fail "ueid $(cat "$T/ueid-second") is not run 1's $(cat "$T/ueid-a")"
+
+      - name: "C14 blocked, stub restarted from its state: stops at verify, exit 2, ak.blob kept"
+        run: |
+          . "$RUNNER_TEMP/scenario.sh"
+          stop_stub
+          start_stub
+          cp client/state/ak.blob "$T/ak-before-block.blob"
+          start_backend block
+          run_client block
+          stop_backend
+          test "$(code block)" = 2 || fail "exit $(code block), expected 2"
+          grep -q '^Enrollment skipped' "$T/block.out" || fail "enrollment not skipped"
+          grep -qE '^  POST /attest/verify  blocked — ' "$T/block.out" || fail "no blocked line"
+          grep -qx 'stopped at /attest/verify' "$T/block.out" || fail "no stopped line"
+          if grep -E '^  POST /(enroll|sign|decrypt)/' "$T/block.out"; then fail "the run went past the blocked verdict"; fi
+          cmp client/state/ak.blob "$T/ak-before-block.blob" || fail "ak.blob changed"
+
+      - name: "C15 the stub forgot the device: one 409, re-enroll once, then all four use cases"
+        run: |
+          . "$RUNNER_TEMP/scenario.sh"
+          stop_stub
+          rm -f "$T/stub-state.json"
+          start_stub
+          start_backend allow
+          run_client forgotten
+          stop_backend
+          test "$(code forgotten)" = 0 || fail "exit $(code forgotten), expected 0"
+          expected="/attest/challenge /attest/verify /enroll/begin /enroll/complete /attest/challenge /attest/verify /sign/challenge /sign/certify /sign/verify /decrypt/challenge /decrypt/certify /decrypt/verify "
+          test "$(routes forgotten)" = "$expected" || fail "routes: $(routes forgotten)"
+          test "$(grep -E '^  POST /attest/verify  ' "$T/forgotten.out" | head -n1)" = '  POST /attest/verify  not enrolled' || fail "the first verify is not the 409"
+          grep -qE '^  POST /attest/verify  (pass|warn) — ' "$T/forgotten.out" || fail "the retry did not pass"
+
+      - name: "C15n always unenrolled: two 409s and a stop, never a loop"
+        run: |
+          . "$RUNNER_TEMP/scenario.sh"
+          fresh_state
+          start_backend unenrolled
+          run_client unenrolled
+          stop_backend
+          test "$(code unenrolled)" = 2 || fail "exit $(code unenrolled), expected 2 (124 is a timeout)"
+          test "$(grep -c '^  POST /attest/verify  not enrolled$' "$T/unenrolled.out")" = 2 || fail "not exactly two 409s"
+          test "$(grep -c '^  POST /attest/verify  ' "$T/unenrolled.out")" = 2 || fail "more than two verify lines"
+          grep -qx 'stopped at /attest/verify' "$T/unenrolled.out" || fail "no stopped line"
+
+      - name: "C16 TPM cleared: the old ak.blob no longer loads, the client enrolls again as a new device"
+        run: |
+          . "$RUNNER_TEMP/scenario.sh"
+          stop_swtpm
+          start_swtpm /tmp/rh-swtpm-b
+          fresh_state
+          install -d -m 700 client/state
+          install -m 600 "$T/ak-swtpm-a.blob" client/state/ak.blob
+          start_backend allow
+          run_client cleared
+          last_ueid 47823 > "$T/ueid-b"
+          stop_backend
+          test "$(code cleared)" = 0 || fail "exit $(code cleared), expected 0"
+          if grep -q '^Enrollment skipped' "$T/cleared.out"; then fail "a dead ak.blob was taken as loading"; fi
+          grep -qE '^  POST /enroll/begin  ' "$T/cleared.out" || fail "no enrollment"
+          test -n "$(cat "$T/ueid-b")" || fail "the backend's page shows no ueid"
+          test "$(cat "$T/ueid-b")" != "$(cat "$T/ueid-a")" || fail "a new TPM kept the old ueid"
+
+      - name: "C18 --complete-enrollment with nothing to complete: no HTTP, no ak.blob, non-zero exit"
+        run: |
+          . "$RUNNER_TEMP/scenario.sh"
+          fresh_state
+          start_backend allow
+          calls=$(grep -c '^stub /' "$T/stub.log")
+          before=$(events 47823 | grep -c '^data:' || true)
+          run_client elevated -- --complete-enrollment
+          after=$(events 47823 | grep -c '^data:' || true)
+          stop_backend
+          test "$(code elevated)" != 0 || fail "exit 0 with nothing to complete"
+          test "$(grep -c '^stub /' "$T/stub.log")" = "$calls" || fail "the stub saw a request"
+          test "$after" = "$before" || fail "the backend saw a request"
+          test ! -e client/state/ak.blob || fail "ak.blob written"
+
+      - name: "C19 no ueid or deviceId reaches the client's output"
+        run: |
+          . "$RUNNER_TEMP/scenario.sh"
+          ids=$(sed -n 's/^stub deviceId //p' "$T/stub.log" | sort -u)
+          test -n "$ids" || fail "the stub issued no deviceId"
+          for id in $ids; do
+            for form in "$id" "${id//-/}"; do
+              hits=$(cat "$T"/*.out "$T"/*.err | grep -ciF "$form" || true)
+              test "$hits" = 0 || fail "client output carries $form"
+            done
+          done
+
+      - name: Logs
+        if: always()
+        run: |
+          for f in stub.log stub-stderr.log backend.log; do echo "==== $f"; cat "$RUNNER_TEMP/$f" 2>/dev/null || true; done
