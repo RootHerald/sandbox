@@ -436,8 +436,8 @@ console.log(`@rootherald/node ${sdkVersion}`);
 console.log(`RootHerald ${baseUrl}`);
 if (!secretKey) console.log("ROOTHERALD_SECRET_KEY is not set");
 
-// 0.0.0.0 inside the container; compose publishes the port on 127.0.0.1 only.
-server.listen(port, "0.0.0.0", () => {
+// Compose sets 0.0.0.0 inside the container and publishes the port on 127.0.0.1 only.
+server.listen(port, process.env.SANDBOX_LISTEN || "127.0.0.1", () => {
   console.log(`Sandbox backend on http://localhost:${port}/`);
 });
 
