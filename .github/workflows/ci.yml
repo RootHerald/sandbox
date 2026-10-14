@@ -91,7 +91,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compose config is loopback-only, unnamed, and defaulted
+      - name: Compose config is loopback-only, unnamed, and defaulted, and only the container listens beyond loopback
         run: |
           set -euo pipefail
           rm -f .env
@@ -102,6 +102,7 @@ jobs:
           jq -e '.services.backend.ports[0].published == "47823"' /tmp/compose.json
           jq -e '.services.backend.environment.ROOTHERALD_URL == "https://rootherald.io"' /tmp/compose.json
           jq -e '.services.backend.environment.SANDBOX_PORT == "47823"' /tmp/compose.json
+          jq -e '.services.backend.environment.SANDBOX_LISTEN == "0.0.0.0"' /tmp/compose.json
           jq -e '(.volumes // {}) | length == 0' /tmp/compose.json
           SANDBOX_PORT=48111 docker compose config --format json \
             | jq -e '.services.backend.ports[0].published == "48111" and .services.backend.ports[0].host_ip == "127.0.0.1"'

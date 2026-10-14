@@ -6,6 +6,7 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
+import os from "node:os";
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -188,11 +189,11 @@ async function startStub() {
 
 // ---------------------------------------------------------------- backend
 
-async function startBackend({ key = CANARY, url, port } = {}) {
+async function startBackend({ key = CANARY, url, port, env: extra = {} } = {}) {
   port ??= await freePort();
   const env = { ...process.env };
   for (const k of Object.keys(env)) if (/^(ROOTHERALD_|SANDBOX_)/i.test(k)) delete env[k];
-  Object.assign(env, { ROOTHERALD_SECRET_KEY: key, ROOTHERALD_URL: url, SANDBOX_PORT: String(port) });
+  Object.assign(env, { ROOTHERALD_SECRET_KEY: key, ROOTHERALD_URL: url, SANDBOX_PORT: String(port) }, extra);
 
   const child = spawn(process.execPath, ["server.js"], { cwd: here, env, stdio: ["ignore", "pipe", "pipe"] });
   const out = { text: "" };
@@ -245,11 +246,11 @@ async function startBackend({ key = CANARY, url, port } = {}) {
   };
 }
 
-function request(port, method, route, { headers = {}, body } = {}) {
+function request(port, method, route, { headers = {}, body, address = "127.0.0.1" } = {}) {
   return new Promise((resolve, reject) => {
     let settled = false;
     const req = http.request(
-      { host: "127.0.0.1", port, method, path: route, headers, setHost: false, agent: false },
+      { host: address, port, method, path: route, headers, setHost: false, agent: false, timeout: 10_000 },
       (res) => {
         const chunks = [];
         res.on("data", (c) => chunks.push(c));
@@ -271,6 +272,7 @@ function request(port, method, route, { headers = {}, body } = {}) {
     req.on("error", (e) => {
       if (!settled) reject(e);
     });
+    req.on("timeout", () => req.destroy(new Error(`no answer from ${address}:${port}`)));
     if (body !== undefined) req.write(body);
     req.end();
   });
@@ -982,6 +984,27 @@ describe("decrypt", () => {
     }
   });
 
+  it("refuses a 30-byte prefix whose base64url is a prefix of the secret's", async () => {
+    const secret = await freshSecret();
+    const prefix = b64url(secret.subarray(0, 30));
+    assert.ok(b64url(secret).startsWith(prefix));
+    const res = await backend.post("/decrypt/verify", { plaintext: prefix });
+    assert.equal(res.status, 422, res.text);
+    assert.equal(res.json.result, "wrong secret");
+    assert.ok(!res.text.includes(b64url(secret)), `the secret leaked: ${res.text}`);
+  });
+
+  it("refuses an empty, missing or non-string plaintext with 422, without leaking the secret", async () => {
+    for (const body of [{ plaintext: "" }, {}, { plaintext: null }, { plaintext: 0 }, { plaintext: [] }]) {
+      const secret = await freshSecret();
+      const res = await backend.post("/decrypt/verify", body);
+      assert.equal(res.status, 422, `${JSON.stringify(body)}: ${res.text}`);
+      assert.equal(res.json.result, "wrong secret", JSON.stringify(body));
+      assert.ok(!res.text.includes(b64url(secret)), `the secret leaked: ${res.text}`);
+      assert.ok(backend.alive, "the backend crashed");
+    }
+  });
+
   it("encrypts a fresh secret per certify", async () => {
     const a = await freshSecret();
     const b = await freshSecret();
@@ -1305,6 +1328,115 @@ describe("no run", () => {
       assert.equal(res.json.result, "attest first", route);
     }
     assert.equal(stub.calls("/api/v1/keys/challenge").length, 0);
+  });
+});
+
+// ================================================================ blocked
+
+describe("blocked", () => {
+  let stub;
+  let backend;
+  before(async () => {
+    stub = await startStub();
+    backend = await startBackend({ url: stub.url });
+  });
+  after(async () => {
+    await backend?.stop();
+    await stub?.close();
+  });
+
+  async function assertKeyRoutesRefused(why) {
+    const before = stub.calls("/api/v1/keys/challenge").length;
+    for (const route of ["/sign/challenge", "/decrypt/challenge"]) {
+      const res = await backend.post(route, {});
+      assert.equal(res.status, 409, `${why}, ${route}: ${res.text}`);
+      assert.equal(res.json.result, "attest first", `${why}, ${route}`);
+    }
+    assert.equal(stub.calls("/api/v1/keys/challenge").length, before, `${why}: a key challenge reached RootHerald`);
+  }
+
+  it("a blocked verdict on the first run keeps no ueid for the key routes", async () => {
+    const res = await attest(backend, stub, { verdict: "fail", earStatus: "contraindicated" });
+    assert.equal(res.status, 403, res.text);
+    await assertKeyRoutesRefused("blocked on the first run");
+  });
+
+  it("a blocked verdict after a passing run keeps no ueid for the key routes", async () => {
+    const pass = await attest(backend, stub);
+    assert.equal(pass.status, 200, pass.text);
+    const ok = await backend.post("/sign/challenge", {});
+    assert.equal(ok.status, 200, ok.text);
+    const res = await attest(backend, stub, { verdict: "fail", earStatus: "contraindicated" });
+    assert.equal(res.status, 403, res.text);
+    await assertKeyRoutesRefused("blocked after a pass");
+  });
+
+  it("an enrollmentRequired answer that names a ueid keeps no ueid for the key routes", async () => {
+    stub.on("/api/v1/attest/verify", () => ({
+      status: 200,
+      body: verdictBody({ verdict: "fail", earStatus: "contraindicated" }, { enrollmentRequired: true }),
+    }));
+    try {
+      const res = await attest(backend, stub);
+      assert.equal(res.status, 409, res.text);
+      assert.equal(res.json.result, "not enrolled");
+      await assertKeyRoutesRefused("not enrolled");
+    } finally {
+      stub.reset();
+    }
+  });
+});
+
+// ================================================================ listen
+
+// The Host guard does not stop a LAN client that sends Host: localhost:<port>,
+// so a native start must not be reachable off the machine at all.
+function lanAddress() {
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const a of list ?? []) {
+      if (a.family === "IPv4" && !a.internal && !a.address.startsWith("169.254.")) return a.address;
+    }
+  }
+  return undefined;
+}
+
+describe("listen", () => {
+  const lan = lanAddress();
+  let stub;
+  before(async () => {
+    stub = await startStub();
+  });
+  after(async () => {
+    await stub?.close();
+  });
+
+  it("this machine has a non-loopback IPv4 address to probe from", () => {
+    assert.ok(lan, `no non-loopback IPv4 address: ${JSON.stringify(os.networkInterfaces())}`);
+  });
+
+  it("with SANDBOX_LISTEN=0.0.0.0, as compose sets it, it answers on that address", { skip: !lan }, async () => {
+    const backend = await startBackend({ url: stub.url, env: { SANDBOX_LISTEN: "0.0.0.0" } });
+    try {
+      const res = await request(backend.port, "GET", "/", { headers: { Host: backend.host }, address: lan });
+      assert.equal(res.status, 200, res.text);
+    } finally {
+      await backend.stop();
+    }
+  });
+
+  it("started natively, it answers on loopback and refuses a connection on that address", { skip: !lan }, async () => {
+    const backend = await startBackend({ url: stub.url });
+    try {
+      const local = await backend.get("/");
+      assert.equal(local.status, 200, local.text);
+      const got = await request(backend.port, "GET", "/", { headers: { Host: backend.host }, address: lan }).then(
+        (res) => `answered ${res.status}`,
+        (err) => err.code ?? err.message,
+      );
+      assert.equal(got, "ECONNREFUSED", `a client on ${lan} reached the backend: ${got}`);
+    } finally {
+      await backend.stop();
+    }
   });
 });
 
