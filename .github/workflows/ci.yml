@@ -1,0 +1,178 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: "@rootherald/node is pinned exactly, and the lock resolves the pin"
+        run: |
+          set -euo pipefail
+          test "$(jq '.dependencies | length' backend/package.json)" = 1
+          pin=$(jq -r '.dependencies["@rootherald/node"]' backend/package.json)
+          lock=$(jq -r '.packages["node_modules/@rootherald/node"].version' backend/package-lock.json)
+          echo "pin=$pin lock=$lock"
+          [[ "$pin" =~ ^[0-9] ]]
+          test "$pin" = "$lock"
+
+      - name: backend/ holds only its own files
+        run: |
+          set -euo pipefail
+          actual=$(git ls-files backend | LC_ALL=C sort | tr '\n' ' ')
+          expected="backend/Dockerfile backend/index.html backend/package-lock.json backend/package.json backend/server.js backend/server.test.js "
+          echo "$actual"
+          test "$actual" = "$expected"
+
+      - name: No node:crypto signature or encryption code in backend/
+        run: |
+          set -euo pipefail
+          test -s backend/server.js
+          if grep -rnE "node:crypto|from ['\"]crypto['\"]|require\(['\"]crypto" backend/ --exclude-dir=node_modules; then echo "::error::forbidden match"; exit 1; fi
+          if grep -nE "subtle|createSign|createVerify|createCipheriv|publicEncrypt" backend/server.js; then echo "::error::forbidden match"; exit 1; fi
+
+      - name: The page writes no HTML from data
+        run: |
+          set -euo pipefail
+          test -s backend/index.html
+          if grep -nE "innerHTML|outerHTML|insertAdjacentHTML|document\.write" backend/index.html; then echo "::error::forbidden match"; exit 1; fi
+
+      - name: .env is ignored and .env.example holds a placeholder only
+        run: |
+          set -euo pipefail
+          git check-ignore -q .env
+          git check-ignore -q backend/node_modules/
+          test "$(wc -l < .env.example)" -eq 3
+          test "$(grep -c '=$' .env.example)" -eq 1
+          grep -qx 'ROOTHERALD_SECRET_KEY=' .env.example
+          grep -qx 'SANDBOX_PORT=47823' .env.example
+          grep -qx 'ROOTHERALD_URL=https://rootherald.io' .env.example
+          test -z "$(git ls-files .env)"
+
+      - name: The README carries the run steps, the route table and the troubleshooting line
+        run: |
+          set -euo pipefail
+          grep -qF 'cp .env.example .env' README.md
+          grep -qF 'docker compose up' README.md
+          grep -qF 'http://localhost:47823/' README.md
+          for route in /enroll/begin /enroll/complete /attest/challenge /attest/verify \
+                       /sign/challenge /sign/certify /sign/verify \
+                       /decrypt/challenge /decrypt/certify /decrypt/verify; do
+            grep -qE "^\|.*POST ${route}\b" README.md || { echo "route table lacks $route"; exit 1; }
+          done
+          grep -qF 'RootHerald refused: ' README.md
+          grep -qF 'If Docker says the port is already allocated, set `SANDBOX_PORT` in `.env` to a free port.' README.md
+          if grep -qF 'Admit as unverified' README.md; then echo "::error::forbidden match"; exit 1; fi
+
+      - run: npm ci --prefix backend
+
+      - name: Backend against a stub of the RootHerald API
+        run: node --test backend/server.test.js
+
+  compose:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compose config is loopback-only, unnamed, and defaulted, and only the container listens beyond loopback
+        run: |
+          set -euo pipefail
+          rm -f .env
+          docker compose config --format json > /tmp/compose.json
+          jq -e '.name == "rootherald-sandbox"' /tmp/compose.json
+          jq -e '[.services[] | has("container_name")] | any | not' /tmp/compose.json
+          jq -e '[.services[].ports[]? | .host_ip == "127.0.0.1"] | (length > 0 and all)' /tmp/compose.json
+          jq -e '.services.backend.ports[0].published == "47823"' /tmp/compose.json
+          jq -e '.services.backend.environment.ROOTHERALD_URL == "https://rootherald.io"' /tmp/compose.json
+          jq -e '.services.backend.environment.SANDBOX_PORT == "47823"' /tmp/compose.json
+          jq -e '.services.backend.environment.SANDBOX_LISTEN == "0.0.0.0"' /tmp/compose.json
+          jq -e '(.volumes // {}) | length == 0' /tmp/compose.json
+          SANDBOX_PORT=48111 docker compose config --format json \
+            | jq -e '.services.backend.ports[0].published == "48111" and .services.backend.ports[0].host_ip == "127.0.0.1"'
+
+      - name: The key is in no image layer, and /app holds only what runs
+        run: |
+          set -euo pipefail
+          canary="rh_sk_cicanary$(openssl rand -hex 16)"
+          echo "::add-mask::$canary"
+          echo "CANARY=$canary" >> "$GITHUB_ENV"
+          printf 'ROOTHERALD_SECRET_KEY=%s\n' "$canary" > .env
+          docker compose build
+          img=$(docker compose config --images | head -n1)
+          echo "IMAGE=$img" >> "$GITHUB_ENV"
+          hits=$(docker save "$img" | grep -caF "$canary" || true)
+          test "$hits" = 0
+          if docker history --no-trunc "$img" | grep -qF "$canary"; then echo "::error::forbidden match"; exit 1; fi
+          app=$(docker run --rm --entrypoint ls "$img" -A /app | LC_ALL=C sort | tr '\n' ' ')
+          echo "/app: $app"
+          test "$app" = "index.html node_modules package-lock.json package.json server.js "
+
+      - name: Coexists with other Docker work, and down -v removes only its own
+        run: |
+          set -euo pipefail
+          docker network create rh-decoy-net
+          docker volume create rh-decoy-vol
+          docker run -d --name rh-decoy-ctr --network rh-decoy-net -v rh-decoy-vol:/data busybox sleep 900
+
+          python3 -m http.server 47823 --bind 127.0.0.1 >/dev/null 2>&1 &
+          listener=$!
+          sleep 1
+          if docker compose up -d --wait; then echo "up succeeded on a taken port"; exit 1; fi
+          kill "$listener"
+          docker compose down
+
+          export ROOTHERALD_URL=http://127.0.0.1:9
+          docker compose up -d --wait
+          for _ in $(seq 30); do
+            curl -fs -o /dev/null -H 'Host: localhost:47823' http://127.0.0.1:47823/ && break
+            sleep 1
+          done
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: localhost:47823' http://127.0.0.1:47823/)" = 200
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: evil.test:47823' http://127.0.0.1:47823/)" = 403
+          out=$(curl -s -w '\n%{http_code}' -X POST -H 'Host: localhost:47823' -H 'Content-Type: application/json' \
+                  -d '{}' http://127.0.0.1:47823/attest/challenge)
+          echo "$out"
+          test "$(tail -n1 <<<"$out")" = 502
+          grep -qF NETWORK_ERROR <<<"$out"
+          if grep -qF "$CANARY" <<<"$out"; then echo "::error::forbidden match"; exit 1; fi
+
+          pin=$(jq -r '.dependencies["@rootherald/node"]' backend/package.json)
+          docker compose logs backend > /tmp/backend.log
+          grep -qF "@rootherald/node $pin" /tmp/backend.log
+          if grep -qF "$CANARY" /tmp/backend.log; then echo "::error::forbidden match"; exit 1; fi
+
+          docker compose down
+          SANDBOX_PORT=48111 docker compose up -d --wait
+          for _ in $(seq 30); do
+            curl -fs -o /dev/null -H 'Host: localhost:48111' http://127.0.0.1:48111/ && break
+            sleep 1
+          done
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: localhost:48111' http://127.0.0.1:48111/)" = 200
+          SANDBOX_PORT=48111 docker compose down -v
+
+          docker compose up -d --wait
+          docker compose down -v
+          test -z "$(docker ps -aq --filter label=com.docker.compose.project=rootherald-sandbox)"
+          test -z "$(docker ps -a --format '{{.Names}}' | grep '^rootherald-sandbox' || true)"
+          test -z "$(docker network ls --format '{{.Name}}' | grep '^rootherald-sandbox' || true)"
+          test -z "$(docker volume ls --format '{{.Name}}' | grep '^rootherald-sandbox' || true)"
+          docker inspect rh-decoy-ctr > /dev/null
+          docker network inspect rh-decoy-net > /dev/null
+          docker volume inspect rh-decoy-vol > /dev/null

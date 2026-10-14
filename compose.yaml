@@ -1,0 +1,12 @@
+name: rootherald-sandbox
+
+services:
+  backend:
+    build: ./backend
+    environment:
+      ROOTHERALD_SECRET_KEY: ${ROOTHERALD_SECRET_KEY:-}
+      ROOTHERALD_URL: ${ROOTHERALD_URL:-https://rootherald.io}
+      SANDBOX_PORT: ${SANDBOX_PORT:-47823}
+      SANDBOX_LISTEN: "0.0.0.0"
+    ports:
+      - "127.0.0.1:${SANDBOX_PORT:-47823}:${SANDBOX_PORT:-47823}"

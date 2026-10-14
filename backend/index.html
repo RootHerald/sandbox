@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RootHerald sandbox</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { margin: 2rem auto; max-width: 64rem; padding: 0 1rem; }
+  h2 { margin-top: 2rem; border-bottom: 1px solid #8884; }
+  h3 { margin: 1rem 0 0.5rem; font-size: 1rem; }
+  .call { border: 1px solid #8884; border-radius: 6px; padding: 0.5rem 0.75rem; margin: 0.5rem 0; }
+  .head { display: flex; gap: 1rem; flex-wrap: wrap; font-family: ui-monospace, monospace; }
+  .status.bad { color: #c33; }
+  .status.good { color: #2a7; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; margin: 0.5rem 0; }
+  dt { opacity: 0.7; }
+  dd { margin: 0; font-family: ui-monospace, monospace; word-break: break-all; }
+  pre { overflow-x: auto; font-size: 0.8rem; margin: 0.25rem 0; }
+  summary { cursor: pointer; opacity: 0.8; }
+</style>
+</head>
+<body>
+<h1>RootHerald sandbox</h1>
+<p id="state">Waiting for the first call</p>
+<main id="runs"></main>
+<script>
+  const GROUPS = [
+    ["enroll", "Enrollment"],
+    ["attest", "Attestation"],
+    ["sign", "Signing"],
+    ["decrypt", "Decryption"],
+  ];
+  const runsEl = document.getElementById("runs");
+  const stateEl = document.getElementById("state");
+  const runs = new Map();
+
+  function el(tag, text, className) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = String(text);
+    if (className) node.className = className;
+    return node;
+  }
+
+  function runSection(number) {
+    let run = runs.get(number);
+    if (run) return run;
+    const section = el("section");
+    section.append(el("h2", "Run " + number));
+    const groups = new Map();
+    for (const [key, title] of GROUPS) {
+      const box = el("div");
+      box.hidden = true;
+      box.append(el("h3", title));
+      section.append(box);
+      groups.set(key, box);
+    }
+    runsEl.prepend(section);
+    run = { section, groups };
+    runs.set(number, run);
+    return run;
+  }
+
+  function details(label, value) {
+    const d = el("details");
+    d.append(el("summary", label));
+    d.append(el("pre", JSON.stringify(value, null, 2)));
+    return d;
+  }
+
+  function verdictList(v) {
+    const dl = el("dl");
+    const rows = [
+      ["Outcome", v.outcome],
+      ["ueid", v.ueid ?? "not disclosed"],
+      ["Chip", v.tpmKind],
+      ["Genuine hardware", v.hardwareGenuine ? "yes" : "no"],
+      ["A maker vouches for the chip", v.ekChainTrusted ? "yes" : "no"],
+    ];
+    for (const [k, value] of rows) {
+      dl.append(el("dt", k));
+      dl.append(el("dd", value));
+    }
+    return dl;
+  }
+
+  function show(ev) {
+    const run = runSection(ev.run);
+    const box = run.groups.get(ev.group);
+    if (!box) return;
+    box.hidden = false;
+    const call = el("div", undefined, "call");
+    const head = el("div", undefined, "head");
+    head.append(el("span", "POST " + ev.route));
+    head.append(el("span", ev.status, "status " + (ev.status < 300 ? "good" : "bad")));
+    head.append(el("span", ev.result));
+    head.append(el("span", new Date(ev.at).toLocaleTimeString()));
+    call.append(head);
+    if (ev.verdict) call.append(verdictList(ev.verdict));
+    if (ev.sdkCall) call.append(el("div", ev.sdkCall));
+    if (ev.sent !== undefined) call.append(details("Sent", ev.sent));
+    if (ev.received !== undefined) call.append(details("Received", ev.received));
+    box.append(call);
+    stateEl.hidden = true;
+  }
+
+  const source = new EventSource('/events');
+  source.onmessage = (m) => show(JSON.parse(m.data));
+  source.onerror = () => {
+    stateEl.hidden = false;
+    stateEl.textContent = "Disconnected from the backend; reconnecting";
+  };
+  source.onopen = () => {
+    runs.clear();
+    runsEl.replaceChildren();
+    stateEl.textContent = "Waiting for the first call";
+    stateEl.hidden = false;
+  };
+</script>
+</body>
+</html>
