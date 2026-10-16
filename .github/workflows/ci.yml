@@ -103,7 +103,7 @@ jobs:
           jq -e '.services.backend.environment.ROOTHERALD_URL == "https://rootherald.io"' /tmp/compose.json
           jq -e '.services.backend.environment.SANDBOX_PORT == "47823"' /tmp/compose.json
           jq -e '.services.backend.environment.SANDBOX_LISTEN == "0.0.0.0"' /tmp/compose.json
-          jq -e '(.volumes // {}) | length == 0' /tmp/compose.json
+          jq -e '[(.volumes // {})[] | (.external // false) == false and (.name | startswith("rootherald-sandbox_"))] | all' /tmp/compose.json
           SANDBOX_PORT=48111 docker compose config --format json \
             | jq -e '.services.backend.ports[0].published == "48111" and .services.backend.ports[0].host_ip == "127.0.0.1"'
 
@@ -115,7 +115,7 @@ jobs:
           echo "CANARY=$canary" >> "$GITHUB_ENV"
           printf 'ROOTHERALD_SECRET_KEY=%s\n' "$canary" > .env
           docker compose build
-          img=$(docker compose config --images | head -n1)
+          img=$(docker compose config --images backend)
           echo "IMAGE=$img" >> "$GITHUB_ENV"
           hits=$(docker save "$img" | grep -caF "$canary" || true)
           test "$hits" = 0
@@ -304,9 +304,68 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - run: |
+      - name: The README's Linux commands are the ones this job and the client image run
+        working-directory: .
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          # Every fenced line under the heading, with backslash continuations joined.
+          awk '/^#+ Run the client on Linux[[:space:]]*$/ { heading = 1; next }
+               heading && !fence && /^#/ { exit }
+               heading && /^```/ { fence = !fence; next }
+               fence { print }' README.md | tr -d '\r' \
+            | sed -e ':a' -e '/\\$/{N; s/\\\n[[:space:]]*/ /; ta}' | sed '/^[[:space:]]*$/d' > "$RUNNER_TEMP/linux-block.txt"
+          cat "$RUNNER_TEMP/linux-block.txt"
+          test -s "$RUNNER_TEMP/linux-block.txt" || fail "README.md has no 'Run the client on Linux' commands"
+
+          test "$(grep -cE '^sudo apt(-get)? install ' "$RUNNER_TEMP/linux-block.txt")" = 1 || fail "the Linux commands hold no single apt install line"
+          packages=$(grep -E '^sudo apt(-get)? install ' "$RUNNER_TEMP/linux-block.txt" | sed -E 's/^sudo apt(-get)? install //' | tr ' ' '\n' | grep -v '^-' | LC_ALL=C sort)
+          for package in build-essential cmake pkg-config libtss2-dev libssl-dev libcurl4-openssl-dev; do
+            grep -qx "$package" <<<"$packages" || fail "the README's apt line lacks $package"
+          done
+          echo "$packages" > "$RUNNER_TEMP/readme-packages.txt"
+
+          grep -qx 'sudo usermod -aG tss \$USER' "$RUNNER_TEMP/linux-block.txt" || fail "no tss group line"
+          test "$(grep -c 'usermod -aG tss' README.md)" = 1 || fail "the tss group line is not in the README exactly once"
+          grep -qF 'z /sys/kernel/security/tpm0/binary_bios_measurements 0440 root tss -' "$RUNNER_TEMP/linux-block.txt" || fail "no event-log tmpfiles rule"
+
+          grep -xE 'cmake --preset linux|cmake --build --preset linux|\./out/build/linux/sandbox-client' "$RUNNER_TEMP/linux-block.txt" > "$RUNNER_TEMP/linux-run.txt" || true
+          printf '%s\n' 'cmake --preset linux' 'cmake --build --preset linux' './out/build/linux/sandbox-client' > "$RUNNER_TEMP/linux-run-expected.txt"
+          diff "$RUNNER_TEMP/linux-run-expected.txt" "$RUNNER_TEMP/linux-run.txt" || fail "the Linux commands do not configure, build and run with the linux preset, in that order"
+
+      - name: "C21 the client image builds with the README's Linux commands and copies files by name"
+        working-directory: .
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          test -s client/Dockerfile || fail "client/Dockerfile is missing"
+          # One RUN command per line: continuations joined, && split.
+          tr -d '\r' < client/Dockerfile | sed -e ':a' -e '/\\$/{N; s/\\\n[[:space:]]*/ /; ta}' \
+            | sed -nE 's/^RUN[[:space:]]+//p' | sed -E 's/[[:space:]]*&&[[:space:]]*/\n/g' \
+            | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g' > "$RUNNER_TEMP/docker-run.txt"
+          cat "$RUNNER_TEMP/docker-run.txt"
+
+          grep -E '(^|[ =])apt(-get)? install ' "$RUNNER_TEMP/docker-run.txt" | sed -E 's/.*apt(-get)? install //' \
+            | tr ' ' '\n' | grep -v '^-' | sed '/^$/d' | LC_ALL=C sort -u > "$RUNNER_TEMP/docker-packages.txt"
+          (cat "$RUNNER_TEMP/readme-packages.txt"; printf '%s\n' swtpm swtpm-tools) | LC_ALL=C sort -u > "$RUNNER_TEMP/docker-packages-expected.txt"
+          diff "$RUNNER_TEMP/docker-packages-expected.txt" "$RUNNER_TEMP/docker-packages.txt" || fail "the image's packages are not the README's apt line plus swtpm swtpm-tools"
+
+          grep -vE '(^|[ =])apt(-get)? |^rm -rf /var/lib/apt/lists/\*$' "$RUNNER_TEMP/docker-run.txt" > "$RUNNER_TEMP/docker-build.txt" || true
+          grep -E '^cmake ' "$RUNNER_TEMP/linux-run.txt" > "$RUNNER_TEMP/readme-build.txt"
+          diff "$RUNNER_TEMP/readme-build.txt" "$RUNNER_TEMP/docker-build.txt" || fail "the image builds with something other than the README's Linux commands"
+
+          if grep -nEi '^[[:space:]]*ADD[[:space:]]' client/Dockerfile; then fail "the Dockerfile uses ADD"; fi
+          if grep -nEi '^[[:space:]]*COPY[[:space:]]+(--[^ ]+[[:space:]]+)*(\./?|client/?)[[:space:]]' client/Dockerfile; then
+            fail "the Dockerfile copies a whole directory, so .env, out/ or state/ can reach a layer"
+          fi
+
+      - name: The README's apt line installs what the build needs
+        run: |
+          set -euo pipefail
+          echo 'APT::Get::Assume-Yes "true";' | sudo tee /etc/apt/apt.conf.d/90-assume-yes > /dev/null
           sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential cmake pkg-config libtss2-dev libssl-dev libcurl4-openssl-dev
+          apt_line=$(grep -E '^sudo apt(-get)? install ' "$RUNNER_TEMP/linux-block.txt")
+          bash -euo pipefail -c "$apt_line"
 
       - name: CMakeLists.txt names no SDK file, library, include path or runtime setting
         run: |
@@ -802,3 +861,290 @@ jobs:
         if: always()
         run: |
           for f in stub.log stub-stderr.log backend.log; do echo "==== $f"; cat "$RUNNER_TEMP/$f" 2>/dev/null || true; done
+
+  client-swtpm:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      STUB_PORT: "47999"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The README's container commands are the ones this job runs
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          awk '/^#+ Run the client in a container[[:space:]]*$/ { heading = 1; next }
+               heading && !fence && /^#/ { exit }
+               heading { print }
+               heading && /^```/ { fence = !fence }' README.md | tr -d '\r' > "$RUNNER_TEMP/container-section.txt"
+          cat "$RUNNER_TEMP/container-section.txt"
+          awk '/^```/ { fence = !fence; next } fence' "$RUNNER_TEMP/container-section.txt" | sed '/^[[:space:]]*$/d' > "$RUNNER_TEMP/container-block.txt"
+          printf '%s\n' 'docker compose up -d' 'docker compose run --rm client' > "$RUNNER_TEMP/container-expected.txt"
+          diff "$RUNNER_TEMP/container-expected.txt" "$RUNNER_TEMP/container-block.txt" || fail "README.md has no 'Run the client in a container' block with the two commands"
+          grep -qF 'docker compose down -v' "$RUNNER_TEMP/container-section.txt" || fail "the container section does not say docker compose down -v makes a new device"
+
+      - name: "C20 the client service: the backend's loopback, no key, no fixed name, the sandbox's own volumes"
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          canary="rh_sk_c20canary$(openssl rand -hex 8)"
+          printf 'ROOTHERALD_SECRET_KEY=%s\n' "$canary" > .env
+          docker compose --profile client config --format json > "$RUNNER_TEMP/client.json"
+          jq '.services.client' "$RUNNER_TEMP/client.json"
+          jq -e '.services.client' "$RUNNER_TEMP/client.json" > /dev/null || fail "compose.yaml has no client service"
+          jq -e '.services.client.network_mode == "service:backend"' "$RUNNER_TEMP/client.json" || fail "the client does not share the backend's loopback"
+          jq -e '.services.client | has("env_file") | not' "$RUNNER_TEMP/client.json" || fail "the client reads an env_file"
+          jq -e '.services.client | has("container_name") | not' "$RUNNER_TEMP/client.json" || fail "the client has a fixed container name"
+          jq -e '(.services.client.environment // {}) | has("ROOTHERALD_SECRET_KEY") | not' "$RUNNER_TEMP/client.json" || fail "the client is given the key"
+          if jq -c '.services.client' "$RUNNER_TEMP/client.json" | grep -qF "$canary"; then fail "the client's configuration carries the key"; fi
+          jq -e '.services.client.environment.SANDBOX_URL == "http://127.0.0.1:47823"' "$RUNNER_TEMP/client.json" || fail "the client's default backend is not the backend's default port"
+          printf 'SANDBOX_PORT=48111\n' >> .env
+          docker compose --profile client config --format json \
+            | jq -e '.services.client.environment.SANDBOX_URL == "http://127.0.0.1:48111"' || fail "the client does not follow SANDBOX_PORT in .env"
+          jq -e '[.services.client.volumes[]? | select(.type == "volume" and .target == "/sandbox/client/state")] | length == 1' "$RUNNER_TEMP/client.json" \
+            || fail "client/state is not a named volume"
+          jq -e '(.volumes | keys) == ["client-state", "swtpm"]' "$RUNNER_TEMP/client.json" || fail "the volumes are not swtpm and client-state"
+          jq -e '[.volumes[] | (.external // false) == false and (.name | startswith("rootherald-sandbox_"))] | all' "$RUNNER_TEMP/client.json" \
+            || fail "a volume is not the sandbox's own"
+          rm .env
+
+      - name: Container helpers
+        run: |
+          cat > "$RUNNER_TEMP/container.sh" <<'EOF'
+          set -euo pipefail
+          T=$RUNNER_TEMP
+          STATE_VOLUME=rootherald-sandbox_client-state
+          fail() { echo "::error::$*"; exit 1; }
+
+          # The stub runs in the backend's network namespace, where the backend
+          # and the client reach it on loopback; it lives as long as that backend.
+          start_stub() {
+            local ready
+            touch "$T/stub.log"
+            ready=$(grep -c '^stub ready' "$T/stub.log" || true)
+            docker run -d --name rh-stub --network "container:$(docker compose ps -q backend)" \
+              -v "$PWD/backend:/stub:ro" -v "$T:/t" \
+              -e SANDBOX_STUB_PORT="$STUB_PORT" -e SANDBOX_STUB_STATE=/t/stub-state.json \
+              rh-stub sh -c 'exec node /stub/stub-rootherald.js >> /t/stub.log 2>> /t/stub-stderr.log' > /dev/null
+            for _ in $(seq 50); do
+              [ "$(grep -c '^stub ready' "$T/stub.log" || true)" -gt "$ready" ] && return 0
+              sleep 0.2
+            done
+            fail "the stub did not come up"
+          }
+          stop_stub() { docker rm -f rh-stub > /dev/null 2>&1 || true; }
+
+          # use_backend <policy> [port]: the README's `docker compose up -d`, on
+          # a .env holding the stub's key for that policy.
+          use_backend() {
+            local port=${2:-47823}
+            stop_stub
+            printf 'ROOTHERALD_SECRET_KEY=rh_sk_stub_%s\nSANDBOX_PORT=%s\nROOTHERALD_URL=http://127.0.0.1:%s\n' "$1" "$port" "$STUB_PORT" > .env
+            docker compose up -d 2>> "$T/compose.log"
+            for _ in $(seq 100); do
+              [ "$(curl -s -o /dev/null -w '%{http_code}' -H "Host: localhost:$port" "http://127.0.0.1:$port/")" = 200 ] && break
+              sleep 0.2
+            done
+            [ "$(curl -s -o /dev/null -w '%{http_code}' -H "Host: localhost:$port" "http://127.0.0.1:$port/")" = 200 ] || fail "the backend did not come up"
+            start_stub
+          }
+
+          # run_client <name>: the README's `docker compose run --rm client`;
+          # output in $T/c-<name>.out and .err, exit code in $T/c-<name>.code
+          run_client() {
+            set +e
+            timeout 300 docker compose run --rm client > "$T/c-$1.out" 2> "$T/c-$1.err"
+            echo $? > "$T/c-$1.code"
+            set -e
+            echo "---- $1: exit $(cat "$T/c-$1.code")"
+            cat "$T/c-$1.out"
+          }
+          code() { cat "$T/c-$1.code"; }
+          routes() { grep -E '^  POST /' "$T/c-$1.out" | awk '{print $2}' | tr '\n' ' '; }
+          stub_calls() { grep -c "^stub $1 " "$T/stub.log" || true; }
+          events() { curl -sN --max-time 3 -H "Host: localhost:$1" "http://127.0.0.1:$1/events" || true; }
+          last_ueid() { events "$1" | grep -o '"verdict":{[^}]*}' | grep -o '"ueid":"[^"]*"' | tail -n1 | cut -d'"' -f4; }
+          in_state() {
+            docker volume inspect "$STATE_VOLUME" > /dev/null 2>&1 || return 0
+            docker run --rm -v "$STATE_VOLUME:/state" busybox sh -c "$1"
+          }
+          state_files() { in_state 'cd /state && find . -type f | sort'; }
+          fresh_state() { in_state 'rm -rf /state/* /state/.[!.]*'; }
+          EOF
+
+      - name: Build the stub's image and the client's image
+        run: |
+          . "$RUNNER_TEMP/container.sh"
+          docker build -q -t rh-stub - <<'DOCKERFILE'
+          FROM node:22-bookworm-slim
+          RUN apt-get update -qq && apt-get install -y -qq tpm2-tools && rm -rf /var/lib/apt/lists/*
+          DOCKERFILE
+          if grep -nE 'createCipheriv|publicEncrypt|KDFa|node:crypto' backend/stub-rootherald.js; then fail "the stub does its own crypto"; fi
+
+      - name: "C22 the client image holds no key, .env, build output or state from the checkout"
+        run: |
+          . "$RUNNER_TEMP/container.sh"
+          canary="rh_sk_cicanary$(openssl rand -hex 16)"
+          echo "::add-mask::$canary"
+          printf 'ROOTHERALD_SECRET_KEY=%s\n' "$canary" > .env
+          grep -qF "$canary" .env || fail "no canary in .env"
+          mkdir -p client/out client/state
+          echo "$canary" > client/out/host-build-marker
+          echo "$canary" > client/state/host-state-marker
+          docker compose --profile client build client
+          img=$(docker compose --profile client config --format json | jq -r '.services.client.image // (.name + "-client")')
+          docker image inspect "$img" > /dev/null || fail "no client image $img"
+          hits=$(docker save "$img" | grep -caF "$canary" || true)
+          test "$hits" = 0 || fail "the client image carries the canary"
+          if docker history --no-trunc "$img" | grep -qF "$canary"; then fail "the client image's history carries the canary"; fi
+          found=$(docker run --rm --entrypoint sh "$img" -c 'find / -xdev \( -name .env -o -name "host-*-marker" \) 2>/dev/null')
+          test -z "$found" || fail "the client image holds $found"
+          rm -rf .env client/out client/state
+
+      - name: "C23 a bare up starts no client"
+        run: |
+          . "$RUNNER_TEMP/container.sh"
+          use_backend allow
+          test -z "$(docker ps -aq --filter label=com.docker.compose.project=rootherald-sandbox --filter label=com.docker.compose.service=client)" \
+            || fail "docker compose up started the client"
+          docker compose ps -a
+
+      - name: "C23 C11 refused enrollment in the container: step 01's line, exit 2, nothing after, nothing written"
+        run: |
+          . "$RUNNER_TEMP/container.sh"
+          fresh_state
+          use_backend refuse
+          run_client refuse
+          test "$(code refuse)" = 2 || fail "exit $(code refuse), expected 2"
+          grep -qE '^  POST /enroll/begin  RootHerald refused: ek_chain_rejected' "$T/c-refuse.out" || fail "no refusal line"
+          grep -qx 'stopped at /enroll/begin' "$T/c-refuse.out" || fail "no stopped line"
+          if grep -E '^  POST /(attest|sign|decrypt)/' "$T/c-refuse.out"; then fail "a use case ran after the refusal"; fi
+          test -z "$(state_files)" || fail "state/ holds $(state_files)"
+
+      - name: "C23 C12 allowed in the container: swtpm said first, all four use cases, never shown as silicon"
+        run: |
+          . "$RUNNER_TEMP/container.sh"
+          fresh_state
+          use_backend allow
+          run_client allow
+          last_ueid 47823 > "$T/c-ueid-a"
+          test "$(code allow)" = 0 || fail "exit $(code allow), expected 0"
+          swtpm_line=$(grep -nx 'Software TPM: swtpm in this container' "$T/c-allow.out" | head -n1 | cut -d: -f1)
+          banner_line=$(grep -nE '^RootHerald SDK: ABI 8\.1, library ' "$T/c-allow.out" | head -n1 | cut -d: -f1)
+          test -n "$swtpm_line" || fail "the container does not say it runs swtpm"
+          test -n "$banner_line" || fail "no SDK banner"
+          test "$swtpm_line" -lt "$banner_line" || fail "the swtpm line comes after the banner"
+          expected="/enroll/begin /enroll/complete /attest/challenge /attest/verify /sign/challenge /sign/certify /sign/verify /decrypt/challenge /decrypt/certify /decrypt/verify "
+          test "$(routes allow)" = "$expected" || fail "routes: $(routes allow)"
+          grep -qE '^  POST /attest/verify  (pass|warn) — Software TPM, not genuine hardware, no maker vouches for this chip' "$T/c-allow.out" || fail "verify line"
+          grep -qx '  POST /sign/certify  sign key certified, not hardware-bound' "$T/c-allow.out" || fail "sign certify line"
+          grep -qx '  POST /decrypt/certify  decrypt key certified, not hardware-bound' "$T/c-allow.out" || fail "decrypt certify line"
+          grep -qx '  POST /sign/verify  signature verified' "$T/c-allow.out" || fail "signature not verified"
+          grep -qx '  POST /decrypt/verify  secret recovered' "$T/c-allow.out" || fail "secret not recovered"
+          test "$(state_files)" = ./ak.blob || fail "state/ holds $(state_files)"
+          test "$(in_state 'stat -c %a /state/ak.blob')" = 600 || fail "ak.blob is mode $(in_state 'stat -c %a /state/ak.blob')"
+          test -n "$(cat "$T/c-ueid-a")" || fail "the backend's page shows no ueid"
+
+      - name: "C23 C13 second run, port changed in .env only: enrollment skipped, same ueid"
+        run: |
+          . "$RUNNER_TEMP/container.sh"
+          enrolls=$(stub_calls /api/v1/attest/enroll)
+          use_backend allow 48111
+          run_client second
+          last_ueid 48111 > "$T/c-ueid-second"
+          test "$(code second)" = 0 || fail "exit $(code second), expected 0"
+          grep -qx 'Enrollment skipped: state/ak.blob loads' "$T/c-second.out" || fail "enrollment not skipped"
+          if grep -E '^  POST /enroll/' "$T/c-second.out"; then fail "the second run enrolled"; fi
+          test "$(stub_calls /api/v1/attest/enroll)" = "$enrolls" || fail "the stub saw an enrollment"
+          test "$(cat "$T/c-ueid-second")" = "$(cat "$T/c-ueid-a")" || fail "ueid $(cat "$T/c-ueid-second") is not run 1's $(cat "$T/c-ueid-a")"
+
+      - name: "C23 C14 blocked in the container, stub restarted from its state: stops at verify, exit 2, ak.blob kept"
+        run: |
+          . "$RUNNER_TEMP/container.sh"
+          before=$(in_state 'sha256sum /state/ak.blob')
+          use_backend block
+          run_client block
+          test "$(code block)" = 2 || fail "exit $(code block), expected 2"
+          grep -q '^Enrollment skipped' "$T/c-block.out" || fail "enrollment not skipped"
+          grep -qE '^  POST /attest/verify  blocked — ' "$T/c-block.out" || fail "no blocked line"
+          grep -qx 'stopped at /attest/verify' "$T/c-block.out" || fail "no stopped line"
+          if grep -E '^  POST /(enroll|sign|decrypt)/' "$T/c-block.out"; then fail "the run went past the blocked verdict"; fi
+          test "$(in_state 'sha256sum /state/ak.blob')" = "$before" || fail "ak.blob changed"
+
+      - name: "C23 C15 the stub forgot the device: one 409, re-enroll once, then all four use cases"
+        run: |
+          . "$RUNNER_TEMP/container.sh"
+          stop_stub
+          rm -f "$T/stub-state.json"
+          use_backend allow
+          run_client forgotten
+          last_ueid 47823 > "$T/c-ueid-forgotten"
+          test "$(code forgotten)" = 0 || fail "exit $(code forgotten), expected 0"
+          expected="/attest/challenge /attest/verify /enroll/begin /enroll/complete /attest/challenge /attest/verify /sign/challenge /sign/certify /sign/verify /decrypt/challenge /decrypt/certify /decrypt/verify "
+          test "$(routes forgotten)" = "$expected" || fail "routes: $(routes forgotten)"
+          test "$(grep -E '^  POST /attest/verify  ' "$T/c-forgotten.out" | head -n1)" = '  POST /attest/verify  not enrolled' || fail "the first verify is not the 409"
+          grep -qE '^  POST /attest/verify  (pass|warn) — ' "$T/c-forgotten.out" || fail "the retry did not pass"
+          test "$(cat "$T/c-ueid-forgotten")" = "$(cat "$T/c-ueid-a")" || fail "the same swtpm came back as another device"
+
+      - name: "C23 C19 no ueid or deviceId reaches the container's output, and tctildr logs no errors"
+        run: |
+          . "$RUNNER_TEMP/container.sh"
+          ids=$(sed -n 's/^stub deviceId //p' "$T/stub.log" | sort -u)
+          test -n "$ids" || fail "the stub issued no deviceId"
+          for id in $ids; do
+            for form in "$id" "${id//-/}"; do
+              hits=$(cat "$T"/c-*.out "$T"/c-*.err | grep -ciF "$form" || true)
+              test "$hits" = 0 || fail "client output carries $form"
+            done
+          done
+          if grep -n 'ERROR:' "$T"/c-*.out "$T"/c-*.err; then fail "the container's output carries TCTI errors"; fi
+
+      - name: "C24 the README's down -v removes the device and nothing foreign; the next run is a new device"
+        run: |
+          . "$RUNNER_TEMP/container.sh"
+          docker volume create sentinel-vol > /dev/null
+          stop_stub
+          docker compose down -v
+          left=$(docker volume ls -q | grep '^rootherald-sandbox_' || true)
+          test -z "$left" || fail "down -v left $left"
+          docker volume inspect sentinel-vol > /dev/null || fail "down -v removed a volume it did not create"
+          rm -f "$T/stub-state.json"
+          use_backend allow
+          run_client new-device
+          last_ueid 47823 > "$T/c-ueid-new"
+          test "$(code new-device)" = 0 || fail "exit $(code new-device), expected 0"
+          if grep -q '^Enrollment skipped' "$T/c-new-device.out"; then fail "the device survived down -v"; fi
+          grep -qE '^  POST /enroll/begin  ' "$T/c-new-device.out" || fail "no enrollment"
+          test -n "$(cat "$T/c-ueid-new")" || fail "the backend's page shows no ueid"
+          test "$(cat "$T/c-ueid-new")" != "$(cat "$T/c-ueid-a")" || fail "down -v kept the old ueid"
+          stop_stub
+          docker compose down -v
+
+      - name: "C25 a CRLF checkout builds and runs the container"
+        run: |
+          . "$RUNNER_TEMP/container.sh"
+          git -c core.autocrlf=true worktree add --detach "$T/crlf" HEAD
+          cd "$T/crlf"
+          file client/Dockerfile compose.yaml
+          file client/Dockerfile | grep -q CRLF || fail "the checkout is not CRLF"
+          file compose.yaml | grep -q CRLF || fail "compose.yaml is not CRLF"
+          docker compose --profile client build client
+          use_backend allow
+          run_client crlf
+          test "$(code crlf)" = 0 || fail "exit $(code crlf), expected 0"
+          grep -qx 'Software TPM: swtpm in this container' "$T/c-crlf.out" || fail "the container does not say it runs swtpm"
+          grep -qE '^  POST /attest/verify  (pass|warn) — Software TPM, not genuine hardware' "$T/c-crlf.out" || fail "verify line"
+          grep -qx '  POST /decrypt/verify  secret recovered' "$T/c-crlf.out" || fail "secret not recovered"
+          if grep -n $'\r' "$T/c-crlf.out"; then fail "the output carries carriage returns"; fi
+          stop_stub
+          docker compose down -v
+
+      - name: Logs
+        if: always()
+        run: |
+          for f in stub.log stub-stderr.log compose.log; do echo "==== $f"; cat "$RUNNER_TEMP/$f" 2>/dev/null || true; done
+          for f in "$RUNNER_TEMP"/c-*.err; do echo "==== $f"; cat "$f"; done 2>/dev/null || true
+          docker compose logs backend 2>/dev/null || true
