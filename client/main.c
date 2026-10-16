@@ -18,9 +18,10 @@
 
 /* Each use case's outcome, and the program's exit code. */
 typedef enum {
-    STEP_OK = 0,        /* carry on */
-    STEP_FAILED = 1,    /* a local SDK or HTTP failure */
-    STEP_STOPPED = 2    /* the backend answered with a non-2xx status */
+    STEP_OK = 0,            /* carry on */
+    STEP_FAILED = 1,        /* a local SDK or HTTP failure */
+    STEP_STOPPED = 2,       /* the backend answered with a non-2xx status */
+    STEP_NOT_ENROLLED = 3   /* /attest/verify answered 409; main enrolls again, never an exit code */
 } STEP_RESULT;
 
 static const char* AK_BLOB_FILE = "ak.blob";
@@ -234,11 +235,9 @@ cleanup:
 
 /*
  * Attestation: answer a fresh challenge with evidence and have the backend
- * verify it. When the backend says the device is not enrolled, enroll and try
- * once more.
+ * verify it.
  */
-static STEP_RESULT RunAttestation(RH_HANDLE session, const char* backendUrl, uint8_t** akBlob, size_t* akLen,
-                                  bool mayEnroll)
+static STEP_RESULT RunAttestation(RH_HANDLE session, const char* backendUrl, const uint8_t* akBlob, size_t akLen)
 {
     STEP_RESULT result = STEP_FAILED;
     RH_STATUS status;
@@ -267,7 +266,7 @@ static STEP_RESULT RunAttestation(RH_HANDLE session, const char* backendUrl, uin
         result = STEP_FAILED;
         goto cleanup;
     }
-    status = RootHeraldAttest(session, challenge, *akBlob, *akLen, evidence, evidenceLen, &evidenceLen);
+    status = RootHeraldAttest(session, challenge, akBlob, akLen, evidence, evidenceLen, &evidenceLen);
     if (status == RH_ERR_BUFFER_TOO_SMALL) {
         free(evidence);
         evidence = malloc(evidenceLen);
@@ -275,7 +274,7 @@ static STEP_RESULT RunAttestation(RH_HANDLE session, const char* backendUrl, uin
             result = STEP_FAILED;
             goto cleanup;
         }
-        status = RootHeraldAttest(session, challenge, *akBlob, *akLen, evidence, evidenceLen, &evidenceLen);
+        status = RootHeraldAttest(session, challenge, akBlob, akLen, evidence, evidenceLen, &evidenceLen);
     }
     if (status != RH_OK) {
         result = SdkFailed("RootHeraldAttest", status);
@@ -286,18 +285,9 @@ static STEP_RESULT RunAttestation(RH_HANDLE session, const char* backendUrl, uin
     free(response);
     response = NULL;
     result = PostRoute(backendUrl, "/attest/verify", evidence, evidenceLen - 1, &httpStatus, &response, &responseLen);
-    if (result == STEP_STOPPED && httpStatus == 409 && mayEnroll) {
-        DeleteStateFile(AK_BLOB_FILE);
-        free(*akBlob);
-        *akBlob = NULL;
-        *akLen = 0;
-        result = RunEnrollment(session, backendUrl, akBlob, akLen);
-        if (result == STEP_OK) {
-            result = RunAttestation(session, backendUrl, akBlob, akLen, false);
-        }
-        goto cleanup;
-    }
-    if (result == STEP_STOPPED) {
+    if (result == STEP_STOPPED && httpStatus == 409) {
+        result = STEP_NOT_ENROLLED;
+    } else if (result == STEP_STOPPED) {
         printf("stopped at /attest/verify\n");
     }
 
@@ -614,7 +604,21 @@ int main(int argc, char** argv)
         result = RunEnrollment(session, backendUrl, &akBlob, &akLen);
     }
     if (result == STEP_OK) {
-        result = RunAttestation(session, backendUrl, &akBlob, &akLen, true);
+        result = RunAttestation(session, backendUrl, akBlob, akLen);
+    }
+    if (result == STEP_NOT_ENROLLED) {
+        DeleteStateFile(AK_BLOB_FILE);
+        free(akBlob);
+        akBlob = NULL;
+        akLen = 0;
+        result = RunEnrollment(session, backendUrl, &akBlob, &akLen);
+        if (result == STEP_OK) {
+            result = RunAttestation(session, backendUrl, akBlob, akLen);
+        }
+        if (result == STEP_NOT_ENROLLED) {
+            printf("stopped at /attest/verify\n");
+            result = STEP_STOPPED;
+        }
     }
     if (result == STEP_OK) {
         result = RunSigning(session, backendUrl, akBlob, akLen);
