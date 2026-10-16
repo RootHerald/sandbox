@@ -465,12 +465,13 @@ function lines(text) {
 // CI runs this file as the RootHerald API for the C client on swtpm:
 //   SANDBOX_STUB_PORT=<port> SANDBOX_STUB_STATE=<file> node backend/server.test.js
 // The backend's key picks what the stub does: rh_sk_stub_refuse refuses
-// enrollment, _allow admits the device as a software TPM, _block fails its
-// verdict, _unenrolled answers every verify with enrollmentRequired.
+// enrollment, _refuse_activation refuses it at activation, _allow admits the
+// device as a software TPM, _block fails its verdict, _unenrolled answers every
+// verify with enrollmentRequired.
 // MakeCredential runs in tpm2_makecredential, so swtpm's ActivateCredential is
 // the check on the enrollment crypto; the sign and decrypt checks are sdk-js's.
 
-const STUB_POLICIES = ["refuse", "allow", "block", "unenrolled"];
+const STUB_POLICIES = ["refuse", "refuse_activation", "allow", "block", "unenrolled"];
 const TPM_ST_ATTEST_CERTIFY = 0x8017;
 const TPM_ST_ATTEST_QUOTE = 0x8018;
 const TPM_ALG_RSA = 0x0001;
@@ -602,6 +603,9 @@ async function serveStub(port, stateFile) {
       enrollments.delete(body.enrollmentId);
       if (!pending || !Buffer.from(body.decryptedSecret ?? "", "base64").equals(pending.secret)) {
         return { status: 400, body: { error: "activation_failed", message: "the enrollment could not be activated" } };
+      }
+      if (policy === "refuse_activation") {
+        return { status: 403, body: { error: "activation_refused", message: "the device is not admitted" } };
       }
       const deviceId = await stableUuid(pending.ekPublicArea);
       installations[pending.signer] = deviceId;

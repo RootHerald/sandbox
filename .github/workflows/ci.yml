@@ -357,6 +357,76 @@ jobs:
           port=$(grep -oE 'SANDBOX_PORT:-[0-9]+' ../compose.yaml | head -n1 | cut -d- -f2)
           test "$(sed -n 2p "$RUNNER_TEMP/default.out")" = "Backend: http://127.0.0.1:$port" || { echo "::error::the default backend is not compose.yaml's port $port"; exit 1; }
 
+      - name: The banner prints before RootHeraldOpen, and a stub library ends the run before it
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          # The link wraps two SDK exports: the library version can be made to
+          # read stub-, and RootHeraldOpen logs its call and fails without a TPM.
+          cat > "$RUNNER_TEMP/wrap.c" <<'EOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include "rootherald.h"
+
+          const char* __real_RootHeraldLibraryVersion(void);
+
+          const char* __wrap_RootHeraldLibraryVersion(void)
+          {
+              const char* version = getenv("WRAP_LIBRARY_VERSION");
+              return version != NULL ? version : __real_RootHeraldLibraryVersion();
+          }
+
+          RH_STATUS __wrap_RootHeraldOpen(RH_HANDLE* handle)
+          {
+              FILE* log = fopen(getenv("WRAP_OPEN_LOG"), "a");
+              if (log != NULL) {
+                  fputs("RootHeraldOpen\n", log);
+                  fclose(log);
+              }
+              *handle = NULL;
+              return RH_ERR_TPM_UNAVAILABLE;
+          }
+          EOF
+          gcc -c -I ../sdk/linux-x64/include -o "$RUNNER_TEMP/wrap.o" "$RUNNER_TEMP/wrap.c"
+          # Applied after project(), so CMake's compiler probe links without the wrapper.
+          cat > "$RUNNER_TEMP/wrap.cmake" <<EOF
+          add_link_options(-Wl,--wrap=RootHeraldLibraryVersion -Wl,--wrap=RootHeraldOpen)
+          link_libraries($RUNNER_TEMP/wrap.o)
+          EOF
+          cmake --preset linux -B out/build/wrapped -DCMAKE_PROJECT_INCLUDE="$RUNNER_TEMP/wrap.cmake"
+          cmake --build out/build/wrapped
+          export WRAP_OPEN_LOG="$RUNNER_TEMP/open.log"
+
+          rm -f "$WRAP_OPEN_LOG"
+          set +e
+          WRAP_LIBRARY_VERSION=stub-0.7.0 SANDBOX_URL=http://127.0.0.1:9 ./out/build/wrapped/sandbox-client > "$RUNNER_TEMP/stub-library.out"
+          code=$?
+          set -e
+          cat "$RUNNER_TEMP/stub-library.out"
+          test "$code" = 1 || fail "stub library: exit $code, expected 1"
+          test "$(sed -n 1p "$RUNNER_TEMP/stub-library.out")" = 'RootHerald SDK: ABI 8.1, library stub-0.7.0' || fail "stub library: the first line is not the banner"
+          test "$(sed -n 2p "$RUNNER_TEMP/stub-library.out")" = 'Backend: http://127.0.0.1:9' || fail "stub library: the second line is not the backend"
+          sed -n 3p "$RUNNER_TEMP/stub-library.out" | grep -qxE 'State: .*/client/state' || fail "stub library: the third line is not the state directory"
+          test ! -e "$WRAP_OPEN_LOG" || fail "the stub library reached RootHeraldOpen"
+
+          rm -f "$WRAP_OPEN_LOG"
+          set +e
+          SANDBOX_URL=http://127.0.0.1:9 ./out/build/wrapped/sandbox-client > "$RUNNER_TEMP/open-fails.out"
+          code=$?
+          set -e
+          cat "$RUNNER_TEMP/open-fails.out"
+          test "$code" = 1 || fail "RootHeraldOpen failing: exit $code, expected 1"
+          test -s "$WRAP_OPEN_LOG" || fail "the wrapped RootHeraldOpen was not called"
+          sed -n 1p "$RUNNER_TEMP/open-fails.out" | grep -qxE 'RootHerald SDK: ABI 8\.1, library [^ ]+' || fail "RootHeraldOpen failing: the first line is not the banner"
+          test "$(sed -n 2p "$RUNNER_TEMP/open-fails.out")" = 'Backend: http://127.0.0.1:9' || fail "RootHeraldOpen failing: the second line is not the backend"
+          sed -n 3p "$RUNNER_TEMP/open-fails.out" | grep -qxE 'State: .*/client/state' || fail "RootHeraldOpen failing: the third line is not the state directory"
+          grep -q '^RootHeraldOpen failed: ' "$RUNNER_TEMP/open-fails.out" || fail "no RootHeraldOpen failure line"
+
+      - name: The README describes no EK certificate line
+        working-directory: .
+        run: |
+          if grep -niE 'EK cert' README.md; then echo "::error::README.md describes an EK certificate line the client does not print"; exit 1; fi
+
   client-linux-swtpm:
     runs-on: ubuntu-24.04
     defaults:
@@ -485,7 +555,7 @@ jobs:
           fresh_state
           run_client unreachable SANDBOX_URL=http://127.0.0.1:9
           test "$(code unreachable)" = 1 || fail "exit $(code unreachable), expected 1"
-          grep -qE '^EK certificate: (present|absent)$' "$T/unreachable.out" || fail "no PreCheck line"
+          grep -qE '^Platform: ' "$T/unreachable.out" || fail "no PreCheck line"
           if grep -q '^stopped at ' "$T/unreachable.out"; then fail "an unreachable backend is not a stop by the backend"; fi
           no_state_files || fail "state/ holds $(find client/state -type f)"
 
@@ -502,6 +572,20 @@ jobs:
           if grep -E '^  POST /(attest|sign|decrypt)/' "$T/refuse.out"; then fail "a use case ran after the refusal"; fi
           no_state_files || fail "state/ holds $(find client/state -type f)"
 
+      - name: "C11a enrollment refused at activation: stops at /enroll/complete, exit 2, nothing written"
+        run: |
+          . "$RUNNER_TEMP/scenario.sh"
+          fresh_state
+          start_backend refuse_activation
+          run_client refuse-activation
+          stop_backend
+          test "$(code refuse-activation)" = 2 || fail "exit $(code refuse-activation), expected 2"
+          grep -qx '  POST /enroll/begin  enrollment started' "$T/refuse-activation.out" || fail "enrollment did not start"
+          grep -qx '  POST /enroll/complete  RootHerald refused: activation_refused' "$T/refuse-activation.out" || fail "no refusal line at /enroll/complete"
+          grep -qx 'stopped at /enroll/complete' "$T/refuse-activation.out" || fail "no stopped line"
+          if grep -E '^  POST /(attest|sign|decrypt)/' "$T/refuse-activation.out"; then fail "a use case ran after the refusal"; fi
+          no_state_files || fail "state/ holds $(find client/state -type f)"
+
       - name: "C12 allowed, fresh state: all four use cases, the software TPM is never shown as silicon"
         run: |
           . "$RUNNER_TEMP/scenario.sh"
@@ -511,7 +595,7 @@ jobs:
           last_ueid 47823 > "$T/ueid-a"
           stop_backend
           test "$(code allow)" = 0 || fail "exit $(code allow), expected 0"
-          grep -qx 'EK certificate: present' "$T/allow.out" || fail "swtpm's EK certificate not seen"
+          if grep -iE 'EK cert' "$T/allow.out"; then fail "the client reports an EK certificate on a software TPM"; fi
           expected="/enroll/begin /enroll/complete /attest/challenge /attest/verify /sign/challenge /sign/certify /sign/verify /decrypt/challenge /decrypt/certify /decrypt/verify "
           test "$(routes allow)" = "$expected" || fail "routes: $(routes allow)"
           grep -qE '^  POST /attest/verify  (pass|warn) — Software TPM, not genuine hardware, no maker vouches for this chip' "$T/allow.out" || fail "verify line"
@@ -570,6 +654,22 @@ jobs:
           test "$(grep -E '^  POST /attest/verify  ' "$T/forgotten.out" | head -n1)" = '  POST /attest/verify  not enrolled' || fail "the first verify is not the 409"
           grep -qE '^  POST /attest/verify  (pass|warn) — ' "$T/forgotten.out" || fail "the retry did not pass"
 
+      - name: "C15d the stub forgot the device and refuses it again: the 409 deletes ak.blob"
+        run: |
+          . "$RUNNER_TEMP/scenario.sh"
+          test -e client/state/ak.blob || fail "no ak.blob to start from"
+          stop_stub
+          rm -f "$T/stub-state.json"
+          start_stub
+          start_backend refuse
+          run_client forgotten-refused
+          stop_backend
+          test "$(code forgotten-refused)" = 2 || fail "exit $(code forgotten-refused), expected 2"
+          test "$(routes forgotten-refused)" = "/attest/challenge /attest/verify /enroll/begin " || fail "routes: $(routes forgotten-refused)"
+          grep -qx '  POST /attest/verify  not enrolled' "$T/forgotten-refused.out" || fail "the verify is not the 409"
+          grep -qx 'stopped at /enroll/begin' "$T/forgotten-refused.out" || fail "no stopped line"
+          test ! -e client/state/ak.blob || fail "ak.blob outlived the 409"
+
       - name: "C15n always unenrolled: two 409s and a stop, never a loop"
         run: |
           . "$RUNNER_TEMP/scenario.sh"
@@ -626,6 +726,12 @@ jobs:
               test "$hits" = 0 || fail "client output carries $form"
             done
           done
+
+      - name: "No run prints an EK certificate line: the device's own read is not a verdict"
+        run: |
+          . "$RUNNER_TEMP/scenario.sh"
+          test -s "$T/allow.out" || fail "no output from the allowed run"
+          if grep -niE 'EK cert' "$T"/*.out; then fail "the client reports an EK certificate"; fi
 
       - name: Logs
         if: always()
