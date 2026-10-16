@@ -69,6 +69,7 @@ static STEP_RESULT RunEnrollment(RH_HANDLE session, const char* backendUrl, uint
     beginBody = malloc(beginLen);
     blob = malloc(blobLen);
     if (beginBody == NULL || blob == NULL) {
+        result = STEP_FAILED;
         goto cleanup;
     }
     /* A real app protects the blob at rest, for example with DPAPI. */
@@ -345,7 +346,6 @@ static STEP_RESULT RunSigning(RH_HANDLE session, const char* backendUrl, const u
     }
 
     /* The first call only measures; the key it creates is kept for the second. */
-    result = STEP_FAILED;
     status = RootHeraldMintKey(session, keyChallenge, akBlob, akLen, NULL, 0, &certificationLen, NULL, 0, &keyBlobLen);
     if (status != RH_ERR_BUFFER_TOO_SMALL) {
         result = SdkFailed("RootHeraldMintKey", status);
@@ -354,6 +354,7 @@ static STEP_RESULT RunSigning(RH_HANDLE session, const char* backendUrl, const u
     certification = malloc(certificationLen);
     keyBlob = malloc(keyBlobLen);
     if (certification == NULL || keyBlob == NULL) {
+        result = STEP_FAILED;
         goto cleanup;
     }
     status = RootHeraldMintKey(session, keyChallenge, akBlob, akLen,
@@ -378,7 +379,6 @@ static STEP_RESULT RunSigning(RH_HANDLE session, const char* backendUrl, const u
         goto cleanup;
     }
 
-    result = STEP_FAILED;
     status = RootHeraldLoadKey(session, keyBlob, keyBlobLen, &key);
     if (status != RH_OK) {
         result = SdkFailed("RootHeraldLoadKey", status);
@@ -391,6 +391,7 @@ static STEP_RESULT RunSigning(RH_HANDLE session, const char* backendUrl, const u
     }
     signature = malloc(info.signature_len);
     if (signature == NULL) {
+        result = STEP_FAILED;
         goto cleanup;
     }
     /* The backend checks a signature over the message's UTF-8 bytes. */
@@ -403,12 +404,14 @@ static STEP_RESULT RunSigning(RH_HANDLE session, const char* backendUrl, const u
 
     encoded = malloc((signatureLen + 2) / 3 * 4 + 1);
     if (encoded == NULL) {
+        result = STEP_FAILED;
         goto cleanup;
     }
     Base64UrlEncode(signature, signatureLen, encoded);
     size_t verifyCap = strlen(encoded) + 32;
     verifyBody = malloc(verifyCap);
     if (verifyBody == NULL) {
+        result = STEP_FAILED;
         goto cleanup;
     }
     snprintf(verifyBody, verifyCap, "{\"signature\":\"%s\"}", encoded);
@@ -469,7 +472,6 @@ static STEP_RESULT RunDecryption(RH_HANDLE session, const char* backendUrl, cons
         goto cleanup;
     }
 
-    result = STEP_FAILED;
     status = RootHeraldMintKey(session, keyChallenge, akBlob, akLen, NULL, 0, &certificationLen, NULL, 0, &keyBlobLen);
     if (status != RH_ERR_BUFFER_TOO_SMALL) {
         result = SdkFailed("RootHeraldMintKey", status);
@@ -478,6 +480,7 @@ static STEP_RESULT RunDecryption(RH_HANDLE session, const char* backendUrl, cons
     certification = malloc(certificationLen);
     keyBlob = malloc(keyBlobLen);
     if (certification == NULL || keyBlob == NULL) {
+        result = STEP_FAILED;
         goto cleanup;
     }
     status = RootHeraldMintKey(session, keyChallenge, akBlob, akLen,
@@ -502,7 +505,6 @@ static STEP_RESULT RunDecryption(RH_HANDLE session, const char* backendUrl, cons
         goto cleanup;
     }
 
-    result = STEP_FAILED;
     status = RootHeraldLoadKey(session, keyBlob, keyBlobLen, &key);
     if (status != RH_OK) {
         result = SdkFailed("RootHeraldLoadKey", status);
@@ -511,6 +513,7 @@ static STEP_RESULT RunDecryption(RH_HANDLE session, const char* backendUrl, cons
     /* The plaintext is never longer than the envelope. */
     plaintext = malloc(strlen(jwe));
     if (plaintext == NULL) {
+        result = STEP_FAILED;
         goto cleanup;
     }
     status = RootHeraldDecrypt(key, jwe, strlen(jwe), plaintext, strlen(jwe), &plaintextLen);
@@ -522,12 +525,14 @@ static STEP_RESULT RunDecryption(RH_HANDLE session, const char* backendUrl, cons
 
     encoded = malloc((plaintextLen + 2) / 3 * 4 + 1);
     if (encoded == NULL) {
+        result = STEP_FAILED;
         goto cleanup;
     }
     Base64UrlEncode(plaintext, plaintextLen, encoded);
     size_t verifyCap = strlen(encoded) + 32;
     verifyBody = malloc(verifyCap);
     if (verifyBody == NULL) {
+        result = STEP_FAILED;
         goto cleanup;
     }
     snprintf(verifyBody, verifyCap, "{\"plaintext\":\"%s\"}", encoded);
@@ -587,7 +592,6 @@ int main(int argc, char** argv)
         goto cleanup;
     }
     printf("Platform: %s\n", posture.platform_name);
-    printf("EK certificate: %s\n", posture.ek_cert_present == 1 ? "present" : "absent");
 
     if (ReadStateFile(AK_BLOB_FILE, &akBlob, &akLen)) {
         status = RootHeraldCheckKey(session, akBlob, akLen);

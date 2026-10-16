@@ -63,7 +63,7 @@ running the client.
 |---|---|
 | `RootHerald SDK: ABI 8.1, library <version>` | The SDK the client is linked against |
 | `Backend:`, `State:` | Where it sends each step, and where it keeps the attestation key blob |
-| `Platform:`, `EK certificate:` | What `RootHeraldPreCheck` read on the device |
+| `Platform:` | What `RootHeraldPreCheck` read on the device |
 | `Enrollment skipped: state/ak.blob loads` | The device is enrolled from an earlier run |
 | `  RootHerald<Verb>: <n> bytes` | An SDK call and the size of what it produced |
 | `  POST <route>  <result>` | The backend's `result` for that step, as sent |

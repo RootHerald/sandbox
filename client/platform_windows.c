@@ -34,6 +34,7 @@ bool PostJson(const char* backendUrl, const char* route, const char* body, size_
               long* httpStatus, char** response, size_t* responseLen)
 {
     bool answered = false;
+    DWORD error = 0;
     WCHAR wideUrl[1024];
     WCHAR wideRoute[256];
     WCHAR host[256];
@@ -59,30 +60,36 @@ bool PostJson(const char* backendUrl, const char* route, const char* body, size_
     session = WinHttpOpen(L"sandbox-client", WINHTTP_ACCESS_TYPE_NO_PROXY,
                           WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (session == NULL) {
-        goto failed;
+        error = GetLastError();
+        goto cleanup;
     }
     WinHttpSetTimeouts(session, 30000, 30000, 30000, 30000);
     connection = WinHttpConnect(session, host, parts.nPort, 0);
     if (connection == NULL) {
-        goto failed;
+        error = GetLastError();
+        goto cleanup;
     }
     request = WinHttpOpenRequest(connection, L"POST", wideRoute, NULL,
                                  WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
     if (request == NULL) {
-        goto failed;
+        error = GetLastError();
+        goto cleanup;
     }
     WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
 
     if (!WinHttpSendRequest(request, L"Content-Type: application/json\r\n", (DWORD)-1L,
                             (LPVOID)body, (DWORD)bodyLen, (DWORD)bodyLen, 0)) {
-        goto failed;
+        error = GetLastError();
+        goto cleanup;
     }
     if (!WinHttpReceiveResponse(request, NULL)) {
-        goto failed;
+        error = GetLastError();
+        goto cleanup;
     }
     if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                              WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize, WINHTTP_NO_HEADER_INDEX)) {
-        goto failed;
+        error = GetLastError();
+        goto cleanup;
     }
 
     buffer = malloc(1);
@@ -93,7 +100,8 @@ bool PostJson(const char* backendUrl, const char* route, const char* body, size_
         DWORD available = 0;
         DWORD read = 0;
         if (!WinHttpQueryDataAvailable(request, &available)) {
-            goto failed;
+            error = GetLastError();
+            goto cleanup;
         }
         if (available == 0) {
             break;
@@ -104,7 +112,8 @@ bool PostJson(const char* backendUrl, const char* route, const char* body, size_
         }
         buffer = grown;
         if (!WinHttpReadData(request, buffer + bufferLen, available, &read)) {
-            goto failed;
+            error = GetLastError();
+            goto cleanup;
         }
         bufferLen += read;
     }
@@ -115,12 +124,11 @@ bool PostJson(const char* backendUrl, const char* route, const char* body, size_
     *responseLen = bufferLen;
     buffer = NULL;
     answered = true;
-    goto cleanup;
-
-failed:
-    printf("HTTP to %s%s failed: error %lu\n", backendUrl, route, GetLastError());
 
 cleanup:
+    if (error != 0) {
+        printf("HTTP to %s%s failed: error %lu\n", backendUrl, route, error);
+    }
     free(buffer);
     if (request != NULL) {
         WinHttpCloseHandle(request);
