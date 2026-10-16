@@ -221,7 +221,7 @@ jobs:
           set -euo pipefail
           git check-ignore -q client/out/x
           git check-ignore -q client/state/x
-          layout='LICENSE|README\.md|\.gitignore|\.env\.example|compose\.yaml|\.github/workflows/ci\.yml|backend/[^/]+|client/(main\.c|platform\.h|platform_windows\.c|platform_linux\.c|CMakeLists\.txt|CMakePresets\.json|Dockerfile)|sdk/.+'
+          layout='LICENSE|README\.md|\.gitignore|\.gitattributes|\.env\.example|compose\.yaml|\.github/workflows/ci\.yml|backend/[^/]+|client/(main\.c|platform\.h|platform_windows\.c|platform_linux\.c|CMakeLists\.txt|CMakePresets\.json|Dockerfile)|sdk/.+'
           if git ls-files | grep -vxE "$layout"; then echo "::error::files outside the repository layout"; exit 1; fi
 
   client-build-windows:
