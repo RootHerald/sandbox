@@ -212,7 +212,7 @@ jobs:
           if find sdk \( -name '*.c' -o -name '*.cpp' -o -name CMakeLists.txt -o -type d -name src \) | grep .; then
             echo "::error::sdk/ holds SDK source"; exit 1
           fi
-          cmp sdk/windows-x64/include/rootherald.h sdk/linux-x64/include/rootherald.h
+          diff --strip-trailing-cr sdk/windows-x64/include/rootherald.h sdk/linux-x64/include/rootherald.h
           grep -qE '^#define ROOTHERALD_ABI_VERSION_MAJOR 8$' sdk/linux-x64/include/rootherald.h
           grep -qE '^#define ROOTHERALD_ABI_VERSION_MINOR 1$' sdk/linux-x64/include/rootherald.h
 
