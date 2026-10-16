@@ -1,0 +1,29 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "windows",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+      "generator": "Visual Studio 17 2022",
+      "architecture": { "value": "x64", "strategy": "set" },
+      "binaryDir": "${sourceDir}/out/build/windows",
+      "cacheVariables": {
+        "CMAKE_PREFIX_PATH": "${sourceDir}/../sdk/windows-x64"
+      }
+    },
+    {
+      "name": "linux",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/out/build/linux",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_PREFIX_PATH": "${sourceDir}/../sdk/linux-x64"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "windows", "configurePreset": "windows", "configuration": "Debug" },
+    { "name": "linux", "configurePreset": "linux" }
+  ]
+}
