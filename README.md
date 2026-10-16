@@ -26,6 +26,52 @@ talks only to this backend; the key never reaches it.
 | `SANDBOX_PORT` | `47823` |
 | `ROOTHERALD_URL` | `https://rootherald.io` |
 
+## Run the client on Windows
+
+`client/` is one C program that runs enrollment, attestation, signing and
+decryption against the backend, built against the prebuilt SDK in `sdk/`.
+
+In Visual Studio 2022 with the "Desktop development with C++" workload, not
+running as administrator: File > Open > Folder on `client/`, then press F10 to
+step through `main`.
+
+Or, from `client/` in a Developer PowerShell for VS 2022:
+
+```powershell
+cmake --preset windows
+cmake --build --preset windows
+.\out\build\windows\Debug\sandbox-client.exe
+```
+
+The first run shows one UAC prompt. `RootHeraldEnrollComplete` needs an
+elevated process, so the program relaunches itself for that call alone.
+
+If you changed `SANDBOX_PORT`, set `SANDBOX_URL=http://127.0.0.1:<port>` before
+running the client.
+
+## Build, run, see why, edit
+
+1. Run the client.
+2. Read the verdict on the backend's page, `http://localhost:47823/`: the
+   outcome, the chip kind, whether the hardware is genuine, and the device's
+   `ueid`.
+3. Edit the policy in the dashboard, run again, and compare. The second run
+   reuses `client/state/ak.blob`, so it skips enrollment and the page shows the
+   same `ueid`. Delete `client/state/` to enroll again.
+
+| The client prints | Meaning |
+|---|---|
+| `RootHerald SDK: ABI 8.1, library <version>` | The SDK the client is linked against |
+| `Backend:`, `State:` | Where it sends each step, and where it keeps the attestation key blob |
+| `Platform:`, `EK certificate:` | What `RootHeraldPreCheck` read on the device |
+| `Enrollment skipped: state/ak.blob loads` | The device is enrolled from an earlier run |
+| `  RootHerald<Verb>: <n> bytes` | An SDK call and the size of what it produced |
+| `  POST <route>  <result>` | The backend's `result` for that step, as sent |
+| `stopped at <route>` | The backend refused that step; nothing after it runs |
+
+The client exits 0 when all four use cases complete, 2 when the backend stopped
+the run, and 1 on a local failure.
+
 ## Routes
 
 The client calls these in order. Every request and response body is a JSON
