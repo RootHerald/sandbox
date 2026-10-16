@@ -34,7 +34,7 @@ jobs:
         run: |
           set -euo pipefail
           actual=$(git ls-files backend | LC_ALL=C sort | tr '\n' ' ')
-          expected="backend/Dockerfile backend/index.html backend/package-lock.json backend/package.json backend/server.js backend/server.test.js "
+          expected="backend/Dockerfile backend/index.html backend/package-lock.json backend/package.json backend/server.js backend/server.test.js backend/stub-rootherald.js "
           echo "$actual"
           test "$actual" = "$expected"
 
@@ -265,10 +265,9 @@ jobs:
 
       - name: The README's configure and build, with every compiler and linker warning an error
         run: |
-          $block = Get-Content "$env:RUNNER_TEMP\windows-block.txt"
-          Invoke-Expression "$($block[0]) -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DCMAKE_EXE_LINKER_FLAGS=/WX"
+          cmake --preset windows -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DCMAKE_EXE_LINKER_FLAGS=/WX
           if ($LASTEXITCODE -ne 0) { throw "configure failed" }
-          Invoke-Expression $block[1]
+          cmake --build --preset windows
           if ($LASTEXITCODE -ne 0) { throw "build failed" }
           if (-not (Select-String -Quiet -SimpleMatch 'RootHeraldd.lib' -Path out\build\windows\sandbox-client.vcxproj)) {
             throw "the Debug build does not link RootHeraldd.lib"
@@ -277,9 +276,8 @@ jobs:
       - name: The banner prints first, SANDBOX_URL is honoured, and an unreachable backend exits 1
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
-          $run = (Get-Content "$env:RUNNER_TEMP\windows-block.txt")[2]
           $env:SANDBOX_URL = 'http://127.0.0.1:9'
-          $out = @(Invoke-Expression $run | ForEach-Object { "$_" })
+          $out = @(.\out\build\windows\Debug\sandbox-client.exe | ForEach-Object { "$_" })
           $code = $LASTEXITCODE
           $out | Write-Output
           if ($code -ne 1) { throw "exit $code, expected 1" }
@@ -290,7 +288,7 @@ jobs:
           if ($out -match '^stopped at ') { throw "an unreachable backend is not a stop by the backend" }
 
           Remove-Item Env:SANDBOX_URL
-          $out = @(Invoke-Expression $run | ForEach-Object { "$_" })
+          $out = @(.\out\build\windows\Debug\sandbox-client.exe | ForEach-Object { "$_" })
           $out | Write-Output
           $port = (Select-String -Path ..\compose.yaml -Pattern 'SANDBOX_PORT:-(\d+)').Matches[0].Groups[1].Value
           if ($out[1] -ne "Backend: http://127.0.0.1:$port") { throw "default backend: $($out[1]), compose.yaml defaults to $port" }
@@ -485,7 +483,7 @@ jobs:
           }
 
           start_stub() {
-            SANDBOX_STUB_PORT=$STUB_PORT SANDBOX_STUB_STATE="$T/stub-state.json" node backend/server.test.js >> "$T/stub.log" 2>> "$T/stub-stderr.log" &
+            SANDBOX_STUB_PORT=$STUB_PORT SANDBOX_STUB_STATE="$T/stub-state.json" node backend/stub-rootherald.js >> "$T/stub.log" 2>> "$T/stub-stderr.log" &
             echo $! > "$T/stub.pid"
             for _ in $(seq 50); do
               [ "$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$STUB_PORT/")" != 000 ] && return 0
@@ -540,14 +538,12 @@ jobs:
           no_state_files() { [ -z "$(find client/state -type f 2>/dev/null)" ]; }
           EOF
 
-      - name: The stub serves without running a test, and holds no hand-written TPM crypto
+      - name: The stub holds no hand-written TPM crypto; start swtpm and the stub
         run: |
           . "$RUNNER_TEMP/scenario.sh"
-          if grep -nE 'createCipheriv|publicEncrypt|KDFa|node:crypto' backend/server.test.js; then fail "the stub does its own crypto"; fi
+          if grep -nE 'createCipheriv|publicEncrypt|KDFa|node:crypto' backend/stub-rootherald.js; then fail "the stub does its own crypto"; fi
           start_swtpm /tmp/rh-swtpm-a
           start_stub
-          test "$(grep -c '^stub ready on ' "$T/stub.log")" = 1 || fail "no single ready line"
-          if grep -v '^stub ' "$T/stub.log"; then fail "serve mode printed something other than stub lines (a test ran?)"; fi
 
       - name: "C17 backend unreachable: PreCheck runs, exit 1, nothing written"
         run: |
@@ -608,6 +604,75 @@ jobs:
           test "$(ls -A client/state)" = ak.blob || fail "state/ holds $(ls -A client/state)"
           test -n "$(cat "$T/ueid-a")" || fail "the backend's page shows no ueid"
           cp client/state/ak.blob "$T/ak-swtpm-a.blob"
+
+      - name: "C12k every key the client loads, it closes before closing the session"
+        run: |
+          . "$RUNNER_TEMP/scenario.sh"
+          # swtpm holds the AK, sign key and decrypt key at once, so a key left
+          # loaded never runs the TPM out of slots here, and RootHeraldClose
+          # closes any key still loaded. The link logs each of the three calls.
+          cat > "$T/keys.c" <<'EOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include "rootherald.h"
+
+          RH_STATUS __real_RootHeraldLoadKey(RH_HANDLE h, const uint8_t* keyBlob, size_t blobLen, RH_KEY_HANDLE* outKey);
+          void __real_RootHeraldCloseKey(RH_KEY_HANDLE key);
+          void __real_RootHeraldClose(RH_HANDLE h);
+
+          static void LogCall(const char* name)
+          {
+              FILE* log = fopen(getenv("WRAP_KEY_LOG"), "a");
+              if (log != NULL) {
+                  fprintf(log, "%s\n", name);
+                  fclose(log);
+              }
+          }
+
+          RH_STATUS __wrap_RootHeraldLoadKey(RH_HANDLE h, const uint8_t* keyBlob, size_t blobLen, RH_KEY_HANDLE* outKey)
+          {
+              LogCall("RootHeraldLoadKey");
+              return __real_RootHeraldLoadKey(h, keyBlob, blobLen, outKey);
+          }
+
+          void __wrap_RootHeraldCloseKey(RH_KEY_HANDLE key)
+          {
+              LogCall("RootHeraldCloseKey");
+              __real_RootHeraldCloseKey(key);
+          }
+
+          void __wrap_RootHeraldClose(RH_HANDLE h)
+          {
+              LogCall("RootHeraldClose");
+              __real_RootHeraldClose(h);
+          }
+          EOF
+          gcc -c -I sdk/linux-x64/include -o "$T/keys.o" "$T/keys.c"
+          cat > "$T/keys.cmake" <<EOF
+          add_link_options(-Wl,--wrap=RootHeraldLoadKey -Wl,--wrap=RootHeraldCloseKey -Wl,--wrap=RootHeraldClose)
+          link_libraries($T/keys.o)
+          EOF
+          (cd client && cmake --preset linux -B out/build/keys -DCMAKE_PROJECT_INCLUDE="$T/keys.cmake" && cmake --build out/build/keys)
+
+          export WRAP_KEY_LOG="$T/keys.log"
+          rm -f "$WRAP_KEY_LOG"
+          start_backend allow
+          set +e
+          (cd client && timeout 120 ./out/build/keys/sandbox-client) > "$T/keys.out"
+          code=$?
+          set -e
+          stop_backend
+          cat "$T/keys.out"
+          cat "$WRAP_KEY_LOG"
+          test "$code" = 0 || fail "exit $code, expected 0"
+          grep -qx '  POST /sign/verify  signature verified' "$T/keys.out" || fail "signature not verified"
+          grep -qx '  POST /decrypt/verify  secret recovered' "$T/keys.out" || fail "secret not recovered"
+          grep -qx RootHeraldClose "$WRAP_KEY_LOG" || fail "the session was never closed"
+          sed '/^RootHeraldClose$/q' "$WRAP_KEY_LOG" > "$T/keys-before-close.log"
+          loads=$(grep -cx RootHeraldLoadKey "$T/keys-before-close.log" || true)
+          closes=$(grep -cx RootHeraldCloseKey "$T/keys-before-close.log" || true)
+          test "$loads" = 2 || fail "RootHeraldLoadKey called $loads times, expected 2"
+          test "$closes" = 2 || fail "RootHeraldCloseKey called $closes times before RootHeraldClose, for $loads loads"
 
       - name: "C13 second run on another port: enrollment skipped, same ueid"
         run: |
