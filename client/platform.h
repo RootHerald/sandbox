@@ -33,7 +33,7 @@ bool PostJson(
     _Out_ long* httpStatus,
     _Outptr_ char** response, _Out_ size_t* responseLen);
 
-/* Files under SANDBOX_STATE_DIR, readable by this user only. */
+/* Files under SANDBOX_STATE_DIR; on Linux, mode 0700 directory and 0600 files. */
 _Success_(return)
 bool ReadStateFile(_In_z_ const char* name, _Outptr_ uint8_t** data, _Out_ size_t* dataLen);
 
