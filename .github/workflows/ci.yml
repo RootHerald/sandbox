@@ -884,7 +884,8 @@ jobs:
           awk '/^```/ { fence = !fence; next } fence' "$RUNNER_TEMP/container-section.txt" | sed '/^[[:space:]]*$/d' > "$RUNNER_TEMP/container-block.txt"
           printf '%s\n' 'docker compose up -d' 'docker compose run --rm client' > "$RUNNER_TEMP/container-expected.txt"
           diff "$RUNNER_TEMP/container-expected.txt" "$RUNNER_TEMP/container-block.txt" || fail "README.md has no 'Run the client in a container' block with the two commands"
-          grep -qF 'docker compose down -v' "$RUNNER_TEMP/container-section.txt" || fail "the container section does not say docker compose down -v makes a new device"
+          grep -qF 'docker compose --profile client down -v' "$RUNNER_TEMP/container-section.txt" \
+            || fail "the container section does not say docker compose --profile client down -v makes a new device"
 
       - name: "C20 the client service: the backend's loopback, no key, no fixed name, the sandbox's own volumes"
         run: |
@@ -901,6 +902,8 @@ jobs:
           jq -e '(.services.client.environment // {}) | has("ROOTHERALD_SECRET_KEY") | not' "$RUNNER_TEMP/client.json" || fail "the client is given the key"
           if jq -c '.services.client' "$RUNNER_TEMP/client.json" | grep -qF "$canary"; then fail "the client's configuration carries the key"; fi
           jq -e '.services.client.environment.SANDBOX_URL == "http://127.0.0.1:47823"' "$RUNNER_TEMP/client.json" || fail "the client's default backend is not the backend's default port"
+          jq -e '.services.client.environment.TSS2_LOG == "all+none"' "$RUNNER_TEMP/client.json" || fail "the client does not set TSS2_LOG=all+none"
+          jq -e '.services.client.environment | has("TSS2_TCTI") | not' "$RUNNER_TEMP/client.json" || fail "the client sets TSS2_TCTI, which the SDK's default transport chain ignores"
           printf 'SANDBOX_PORT=48111\n' >> .env
           docker compose --profile client config --format json \
             | jq -e '.services.client.environment.SANDBOX_URL == "http://127.0.0.1:48111"' || fail "the client does not follow SANDBOX_PORT in .env"
@@ -1102,12 +1105,12 @@ jobs:
           done
           if grep -n 'ERROR:' "$T"/c-*.out "$T"/c-*.err; then fail "the container's output carries TCTI errors"; fi
 
-      - name: "C24 the README's down -v removes the device and nothing foreign; the next run is a new device"
+      - name: "C24 the README's --profile client down -v removes the device and nothing foreign; the next run is a new device"
         run: |
           . "$RUNNER_TEMP/container.sh"
           docker volume create sentinel-vol > /dev/null
           stop_stub
-          docker compose down -v
+          docker compose --profile client down -v
           left=$(docker volume ls -q | grep '^rootherald-sandbox_' || true)
           test -z "$left" || fail "down -v left $left"
           docker volume inspect sentinel-vol > /dev/null || fail "down -v removed a volume it did not create"
@@ -1121,7 +1124,25 @@ jobs:
           test -n "$(cat "$T/c-ueid-new")" || fail "the backend's page shows no ueid"
           test "$(cat "$T/c-ueid-new")" != "$(cat "$T/c-ueid-a")" || fail "down -v kept the old ueid"
           stop_stub
-          docker compose down -v
+          docker compose --profile client down -v
+
+      - name: "C26 six runs on one swtpm volume: each passes as the same device, never TPM_RC_LOCKOUT"
+        run: |
+          . "$RUNNER_TEMP/container.sh"
+          stop_stub
+          docker compose --profile client down -v
+          rm -f "$T/stub-state.json"
+          use_backend allow
+          for i in 1 2 3 4 5 6; do
+            run_client "six-$i"
+            last_ueid 47823 > "$T/c-ueid-six-$i"
+            if grep -nE 'TPM_RC_LOCKOUT|0x0*921' "$T/c-six-$i.out" "$T/c-six-$i.err"; then fail "run $i hit TPM_RC_LOCKOUT"; fi
+            test "$(code "six-$i")" = 0 || fail "run $i exit $(code "six-$i"), expected 0"
+            grep -qE '^  POST /attest/verify  (pass|warn) — ' "$T/c-six-$i.out" || fail "run $i did not pass"
+            test "$(cat "$T/c-ueid-six-$i")" = "$(cat "$T/c-ueid-six-1")" || fail "run $i came back as another device"
+          done
+          stop_stub
+          docker compose --profile client down -v
 
       - name: "C25 a CRLF checkout builds and runs the container"
         run: |
@@ -1140,7 +1161,7 @@ jobs:
           grep -qx '  POST /decrypt/verify  secret recovered' "$T/c-crlf.out" || fail "secret not recovered"
           if grep -n $'\r' "$T/c-crlf.out"; then fail "the output carries carriage returns"; fi
           stop_stub
-          docker compose down -v
+          docker compose --profile client down -v
 
       - name: Logs
         if: always()
