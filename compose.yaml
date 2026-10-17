@@ -10,3 +10,43 @@ services:
       SANDBOX_LISTEN: "0.0.0.0"
     ports:
       - "127.0.0.1:${SANDBOX_PORT:-47823}:${SANDBOX_PORT:-47823}"
+
+  client:
+    profiles: [client]
+    build:
+      context: .
+      dockerfile: client/Dockerfile
+    # The backend answers only a loopback Host, so the client shares its network.
+    network_mode: service:backend
+    depends_on: [backend]
+    environment:
+      SANDBOX_URL: http://127.0.0.1:${SANDBOX_PORT:-47823}
+      # The SDK's default transport chain logs an error for each missing /dev/tpm* before it reaches swtpm.
+      TSS2_LOG: all+none
+    volumes:
+      - swtpm:/swtpm
+      - client-state:/sandbox/client/state
+    # swtpm 0.7 counts each unclean stop towards TPM_RC_LOCKOUT, so it is stopped in order after the client.
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        if [ ! -f /swtpm/tpm2-00.permall ]; then
+          swtpm_setup --tpm2 --tpmstate /swtpm --create-ek-cert > /dev/null
+        fi
+        flags=not-need-init
+        if [ ! -f /swtpm/tpm2-00.volatilestate ]; then
+          flags=$$flags,startup-clear
+        fi
+        swtpm socket --tpm2 --tpmstate dir=/swtpm --server type=tcp,port=2321 --ctrl type=tcp,port=2322 --flags $$flags --daemon
+        echo "Software TPM: swtpm in this container"
+        status=0
+        ./out/build/linux/sandbox-client || status=$$?
+        swtpm_ioctl --tcp 127.0.0.1:2322 -v
+        swtpm_ioctl --tcp 127.0.0.1:2322 -s
+        exit $$status
+
+volumes:
+  swtpm:
+  client-state:

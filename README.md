@@ -46,8 +46,44 @@ cmake --build --preset windows
 The first run shows one UAC prompt. `RootHeraldEnrollComplete` needs an
 elevated process, so the program relaunches itself for that call alone.
 
-If you changed `SANDBOX_PORT`, set `SANDBOX_URL=http://127.0.0.1:<port>` before
-running the client.
+## Run the client on Linux
+
+On Ubuntu 24.04 with a TPM at `/dev/tpmrm0`, install the build tools, add
+yourself to the `tss` group that owns the TPM, and let that group read the
+firmware event log:
+
+```bash
+sudo apt install build-essential cmake pkg-config libtss2-dev libssl-dev libcurl4-openssl-dev
+sudo usermod -aG tss $USER
+echo 'z /sys/kernel/security/tpm0/binary_bios_measurements 0440 root tss -' | sudo tee /etc/tmpfiles.d/rootherald-eventlog.conf
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/rootherald-eventlog.conf
+```
+
+Log out and back in so the group applies, then from `client/`:
+
+```bash
+cmake --preset linux
+cmake --build --preset linux
+./out/build/linux/sandbox-client
+```
+
+On Windows or Linux, if you changed `SANDBOX_PORT`, set
+`SANDBOX_URL=http://127.0.0.1:<port>` before running the client.
+
+## Run the client in a container
+
+The same program, built in a Linux container and run against swtpm, a software
+TPM. It needs Docker and the key in `.env`, nothing else. From the repository
+root:
+
+```bash
+docker compose up -d
+docker compose run --rm client
+```
+
+The software TPM is kept in a Docker volume, so every run is the same device.
+`docker compose --profile client down -v` deletes it, and the next run is a new
+device with a new `ueid`.
 
 ## Build, run, see why, edit
 
@@ -61,6 +97,7 @@ running the client.
 
 | The client prints | Meaning |
 |---|---|
+| `Software TPM: swtpm in this container` | The container's client runs against swtpm, not a hardware TPM |
 | `RootHerald SDK: ABI 8.1, library <version>` | The SDK the client is linked against |
 | `Backend:`, `State:` | Where it sends each step, and where it keeps the attestation key blob |
 | `Platform:` | What `RootHeraldPreCheck` read on the device |
