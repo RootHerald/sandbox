@@ -73,8 +73,7 @@ On Windows or Linux, if you changed `SANDBOX_PORT`, set
 ## Run the client in a container
 
 The same program, built in a Linux container and run against swtpm, a software
-TPM. It needs Docker and the key in `.env`, nothing else. From the repository
-root:
+TPM. It needs Docker and the key in `.env`. From the repository root:
 
 ```bash
 docker compose up -d
