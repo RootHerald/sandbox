@@ -896,6 +896,8 @@ jobs:
           docker compose --profile client config --format json > "$RUNNER_TEMP/client.json"
           jq '.services.client' "$RUNNER_TEMP/client.json"
           jq -e '.services.client' "$RUNNER_TEMP/client.json" > /dev/null || fail "compose.yaml has no client service"
+          jq -e '.services.client.profiles == ["client"]' "$RUNNER_TEMP/client.json" || fail "the client is not behind profiles: [client]"
+          if docker compose config --services | grep -qx client; then fail "a bare docker compose config lists the client"; fi
           jq -e '.services.client.network_mode == "service:backend"' "$RUNNER_TEMP/client.json" || fail "the client does not share the backend's loopback"
           jq -e '.services.client | has("env_file") | not' "$RUNNER_TEMP/client.json" || fail "the client reads an env_file"
           jq -e '.services.client | has("container_name") | not' "$RUNNER_TEMP/client.json" || fail "the client has a fixed container name"
@@ -1010,10 +1012,18 @@ jobs:
       - name: "C23 a bare up starts no client"
         run: |
           . "$RUNNER_TEMP/container.sh"
+          # C22 built the client image; set it aside so a build by this up shows.
+          docker image tag rootherald-sandbox-client rh-c22-client
+          docker image rm rootherald-sandbox-client > /dev/null
           use_backend allow
           test -z "$(docker ps -aq --filter label=com.docker.compose.project=rootherald-sandbox --filter label=com.docker.compose.service=client)" \
             || fail "docker compose up started the client"
           docker compose ps -a
+          if docker image inspect rootherald-sandbox-client > /dev/null 2>&1; then fail "docker compose up built the client image"; fi
+          for volume in rootherald-sandbox_swtpm rootherald-sandbox_client-state; do
+            if docker volume inspect "$volume" > /dev/null 2>&1; then fail "docker compose up created the $volume volume"; fi
+          done
+          docker image tag rh-c22-client rootherald-sandbox-client
 
       - name: "C23 C11 refused enrollment in the container: step 01's line, exit 2, nothing after, nothing written"
         run: |
