@@ -89,7 +89,10 @@ device with a new `ueid`.
 1. Run the client.
 2. Read the verdict on the backend's page, `http://localhost:47823/`: the
    outcome, the chip kind, whether the hardware is genuine, and the device's
-   `ueid`.
+   `ueid`. A `warn` or `blocked` verdict also carries its reason: the client
+   prints it at the end of the `/attest/verify` line, the page shows it as
+   Reason, and the backend's console logs it with `verdict.reason.code`, the
+   stable code to branch on.
 3. Edit the policy in the dashboard, run again, and compare. The second run
    reuses `client/state/ak.blob`, so it skips enrollment and the page shows the
    same `ueid`. Delete `client/state/` to enroll again.
