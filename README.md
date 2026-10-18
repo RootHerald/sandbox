@@ -4,6 +4,11 @@ A local backend that holds your RootHerald secret key and calls RootHerald with
 [`@rootherald/node`](https://www.npmjs.com/package/@rootherald/node). The device
 talks only to this backend; the key never reaches it.
 
+```bash
+git clone https://github.com/RootHerald/sandbox.git
+cd sandbox
+```
+
 ## Run the backend
 
 1. In the [dashboard](https://rootherald.io/dashboard), build a policy in the
