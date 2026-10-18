@@ -257,9 +257,12 @@ function verdictOutcome(result, call) {
   const vouched = device.ekChainTrusted === true;
   const ueid = typeof device.ueid === "string" ? device.ueid : undefined;
 
+  const reason = outcome === "pass" ? undefined : verdictReason(result.reason);
+
   let line = chipWords(device.tpmKind);
   if (!genuine) line += ", not genuine hardware";
   if (!vouched) line += ", no maker vouches for this chip";
+  if (reason) line += `. ${reason.text.replace(UUID, "[device id]")}`;
 
   /** @type {Outcome} */
   let answer;
@@ -270,15 +273,40 @@ function verdictOutcome(result, call) {
     run.ueid = ueid;
   }
 
+  let log =
+    `verdict ${outcome} ueid=${ueid ?? "not disclosed"} tpmKind=${String(device.tpmKind ?? "unknown")} ` +
+    `hardwareGenuine=${genuine} ekChainTrusted=${vouched}`;
+  if (reason) log += `\n  reason ${reason.code}: ${reason.text}`;
+
   return {
     ...answer,
     ...call,
     received: result,
-    log:
-      `verdict ${outcome} ueid=${ueid ?? "not disclosed"} tpmKind=${String(device.tpmKind ?? "unknown")} ` +
-      `hardwareGenuine=${genuine} ekChainTrusted=${vouched}`,
-    verdict: { outcome, ueid, tpmKind: chipWords(device.tpmKind), hardwareGenuine: genuine, ekChainTrusted: vouched },
+    log,
+    verdict: {
+      outcome,
+      ueid,
+      tpmKind: chipWords(device.tpmKind),
+      hardwareGenuine: genuine,
+      ekChainTrusted: vouched,
+      ...(reason ? { reason } : {}),
+    },
   };
+}
+
+/**
+ * Control characters become one space: the client and the console each print
+ * the text inside a single line.
+ * @param {unknown} reason
+ * @returns {{ code: string, text: string } | undefined}
+ */
+function verdictReason(reason) {
+  if (!reason || typeof reason !== "object") return undefined;
+  const { code, text } = /** @type {{ code?: unknown, text?: unknown }} */ (reason);
+  if (typeof code !== "string" || code === "" || typeof text !== "string") return undefined;
+  const oneLine = text.replace(/[\x00-\x1f\x7f]+/g, " ").trim();
+  if (oneLine === "") return undefined;
+  return { code, text: oneLine };
 }
 
 /** @param {KeyPurpose} purpose @returns {Promise<Outcome>} */

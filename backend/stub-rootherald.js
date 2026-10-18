@@ -203,7 +203,10 @@ async function serveStub(port, stateFile) {
         return { status: 200, body: verdictBody({ ...softwareTpm(undefined), verdict: "fail", earStatus: "contraindicated" }, { enrollmentRequired: true }) };
       }
       if (policy === "block") {
-        return { status: 200, body: verdictBody({ ...softwareTpm(ueid), verdict: "fail", earStatus: "contraindicated" }) };
+        const blocked = verdictBody({ ...softwareTpm(ueid), verdict: "fail", earStatus: "contraindicated" });
+        // As platform 9b4655c4 sends it: VerdictReasons.cs, VerdictReasonWireTests.AFail_CarriesTheReason_OnTheVerdict.
+        blocked.verdict.reason = { code: "chip_kind_not_accepted", text: "Platform or chip not in this policy" };
+        return { status: 200, body: blocked };
       }
       return { status: 200, body: verdictBody({ ...softwareTpm(ueid), verdict: "warn", earStatus: "warning" }) };
     }

@@ -77,6 +77,7 @@
       ["Genuine hardware", v.hardwareGenuine ? "yes" : "no"],
       ["A maker vouches for the chip", v.ekChainTrusted ? "yes" : "no"],
     ];
+    if (v.reason) rows.push(["Reason", v.reason.text]);
     for (const [k, value] of rows) {
       dl.append(el("dt", k));
       dl.append(el("dd", value));

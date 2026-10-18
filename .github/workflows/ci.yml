@@ -51,6 +51,20 @@ jobs:
           test -s backend/index.html
           if grep -nE "innerHTML|outerHTML|insertAdjacentHTML|document\.write" backend/index.html; then echo "::error::forbidden match"; exit 1; fi
 
+      - name: The page shows a reason's text and never its code; the README names verdict.reason.code and nothing a policy decides
+        run: |
+          set -euo pipefail
+          grep -qF 'reason.text' backend/index.html || { echo "::error::the page shows no reason text"; exit 1; }
+          if grep -nF '.code' backend/index.html; then echo "::error::the page shows a reason code"; exit 1; fi
+          grep -qF 'verdict.reason.code' README.md || { echo "::error::the README does not name verdict.reason.code"; exit 1; }
+          if grep -niE 'builder rule|rule that decided' README.md; then echo "::error::the README promises a builder rule"; exit 1; fi
+          # The wire codes and the fixture texts of platform 9b4655c4 VerdictReasons.cs.
+          codes='not_enrolled|evidence_not_verified|expected_device_mismatch|chip_kind_not_accepted|cloud_cross_check_required|mac_unattested|chip_reset|identities_per_chip|os_switch|os_switches_per_window|boot_log_missing|secure_boot_off|secure_boot_not_microsoft|revoked_boot_component|secure_boot_ca_2023_missing|boot_stage_not_measured|boot_stage_mismatch|boot_changed|unusual_boot_setup|boot_setup_too_few_seen|boot_setup_not_checked'
+          if grep -nwE "$codes" README.md backend/server.js backend/index.html; then echo "::error::a reason code is named outside the tests"; exit 1; fi
+          for text in 'Platform or chip not in this policy' 'Unusual boot setup' 'Device not enrolled'; do
+            if grep -nF "$text" README.md; then echo "::error::the README quotes a reason's text"; exit 1; fi
+          done
+
       - name: .env is ignored and .env.example holds a placeholder only
         run: |
           set -euo pipefail
@@ -759,6 +773,7 @@ jobs:
           test "$(code block)" = 2 || fail "exit $(code block), expected 2"
           grep -q '^Enrollment skipped' "$T/block.out" || fail "enrollment not skipped"
           grep -qE '^  POST /attest/verify  blocked — ' "$T/block.out" || fail "no blocked line"
+          grep -qE '^  POST /attest/verify  blocked — .*\. Platform or chip not in this policy$' "$T/block.out" || fail "the blocked line does not end with the reason"
           grep -qx 'stopped at /attest/verify' "$T/block.out" || fail "no stopped line"
           if grep -E '^  POST /(enroll|sign|decrypt)/' "$T/block.out"; then fail "the run went past the blocked verdict"; fi
           cmp client/state/ak.blob "$T/ak-before-block.blob" || fail "ak.blob changed"
