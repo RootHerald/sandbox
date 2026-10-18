@@ -854,6 +854,162 @@ describe("attest", () => {
   });
 });
 
+// ================================================================ reason
+
+// Codes and texts from platform 9b4655c4, services/api/RootHerald.Core/Contracts/VerdictReasons.cs.
+// The shape, exactly {code, text} on the verdict and never under device, and each
+// code's outcome, from Integration/VerdictReasonWireTests.cs at that commit.
+const CHIP_KIND_NOT_ACCEPTED = { code: "chip_kind_not_accepted", text: "Platform or chip not in this policy" };
+const UNUSUAL_BOOT_SETUP = { code: "unusual_boot_setup", text: "Unusual boot setup" };
+const NOT_ENROLLED = { code: "not_enrolled", text: "Device not enrolled" };
+
+const SOFTWARE_TPM = { tpmKind: "emulated", hardwareGenuine: false, ekChainTrusted: false };
+const SOFTWARE_TPM_WORDS = "Software TPM, not genuine hardware, no maker vouches for this chip";
+const BLOCKED_SOFTWARE_TPM = { verdict: "fail", earStatus: "contraindicated", ...SOFTWARE_TPM };
+const BLOCKED_LINE = `verdict fail ueid=${UEID} tpmKind=emulated hardwareGenuine=false ekChainTrusted=false`;
+
+function reasonBody(device, reason, extra = {}) {
+  const body = verdictBody(device, extra);
+  body.verdict.reason = reason;
+  return body;
+}
+
+describe("reason", () => {
+  let stub;
+  let backend;
+  let stream;
+  before(async () => {
+    stub = await startStub();
+    backend = await startBackend({ url: stub.url });
+    stream = openEvents(backend);
+  });
+  after(async () => {
+    stream?.close();
+    await backend?.stop();
+    await stub?.close();
+  });
+
+  // One verify answered with body. A /sign/verify follows it so that everything
+  // the verify printed has reached the console before the lines are read.
+  async function verifyWith(body) {
+    stub.on("/api/v1/attest/verify", () => ({ status: 200, body }));
+    const logStart = backend.logs.length;
+    const eventStart = stream.events.length;
+    try {
+      const c = await backend.post("/attest/challenge", {});
+      assert.equal(c.status, 200, c.text);
+      const res = await backend.post("/attest/verify", EVIDENCE);
+      await backend.post("/sign/verify", {});
+
+      const marker = "/sign/verify 409 attest first";
+      const deadline = Date.now() + 5000;
+      while (!backend.logs.slice(logStart).includes(marker)) {
+        if (Date.now() > deadline) assert.fail(`no "${marker}" on the console:\n${backend.logs.slice(logStart)}`);
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      const all = lines(backend.logs.slice(logStart));
+      const log = all.slice(all.findIndex((l) => l.startsWith("verdict ")), all.indexOf(marker));
+
+      const events = await stream.waitFor((evs) => evs.slice(eventStart).some((e) => e.route === "/sign/verify"));
+      const event = events.slice(eventStart).find((e) => e.route === "/attest/verify");
+      return { res, log, event };
+    } finally {
+      stub.reset();
+    }
+  }
+
+  it("a blocked verdict ends its result with the reason, and the console and page carry it", async () => {
+    const { res, log, event } = await verifyWith(reasonBody(BLOCKED_SOFTWARE_TPM, CHIP_KIND_NOT_ACCEPTED));
+    assert.equal(res.status, 403, res.text);
+    assert.equal(res.json.result, `blocked ${DASH} ${SOFTWARE_TPM_WORDS}. Platform or chip not in this policy`);
+    assert.ok(!res.text.includes(CHIP_KIND_NOT_ACCEPTED.code), res.text);
+    assert.deepEqual(event.verdict.reason, CHIP_KIND_NOT_ACCEPTED);
+    assert.deepEqual(log, [BLOCKED_LINE, "  reason chip_kind_not_accepted: Platform or chip not in this policy"]);
+  });
+
+  it("a warning ends its result with the reason, and the console and page carry it", async () => {
+    const { res, log, event } = await verifyWith(reasonBody({ verdict: "warn", earStatus: "warning" }, UNUSUAL_BOOT_SETUP));
+    assert.equal(res.status, 200, res.text);
+    assert.equal(res.json.result, `warn ${DASH} Discrete chip. Unusual boot setup`);
+    assert.ok(!res.text.includes(UNUSUAL_BOOT_SETUP.code), res.text);
+    assert.deepEqual(event.verdict.reason, UNUSUAL_BOOT_SETUP);
+    assert.deepEqual(log, [
+      `verdict warn ueid=${UEID} tpmKind=discrete-tpm hardwareGenuine=true ekChainTrusted=true`,
+      "  reason unusual_boot_setup: Unusual boot setup",
+    ]);
+  });
+
+  it("a pass shows no reason", async () => {
+    const { res, log, event } = await verifyWith(verdictBody());
+    assert.equal(res.status, 200, res.text);
+    assert.equal(res.json.result, `pass ${DASH} Discrete chip`);
+    assert.ok(!("reason" in event.verdict), JSON.stringify(event.verdict));
+    assert.deepEqual(log, [`verdict pass ueid=${UEID} tpmKind=discrete-tpm hardwareGenuine=true ekChainTrusted=true`]);
+  });
+
+  it("a pass that arrives with a reason shows none", async () => {
+    const { res, log, event } = await verifyWith(reasonBody({}, CHIP_KIND_NOT_ACCEPTED));
+    assert.equal(res.status, 200, res.text);
+    assert.equal(res.json.result, `pass ${DASH} Discrete chip`);
+    assert.ok(!("reason" in event.verdict), JSON.stringify(event.verdict));
+    assert.deepEqual(log, [`verdict pass ueid=${UEID} tpmKind=discrete-tpm hardwareGenuine=true ekChainTrusted=true`]);
+  });
+
+  it("a 409 keeps its result, and the console and page still name the reason", async () => {
+    const body = reasonBody(
+      { verdict: "fail", earStatus: "contraindicated", ueid: undefined },
+      NOT_ENROLLED,
+      { enrollmentRequired: true },
+    );
+    const { res, log, event } = await verifyWith(body);
+    assert.equal(res.status, 409, res.text);
+    assert.equal(res.json.result, "not enrolled");
+    assert.deepEqual(event.verdict.reason, NOT_ENROLLED);
+    assert.deepEqual(log, [
+      "verdict fail ueid=not disclosed tpmKind=discrete-tpm hardwareGenuine=true ekChainTrusted=true",
+      "  reason not_enrolled: Device not enrolled",
+    ]);
+  });
+
+  it("treats a malformed reason as no reason", async () => {
+    const malformed = [
+      { code: CHIP_KIND_NOT_ACCEPTED.code, text: "" },
+      { code: CHIP_KIND_NOT_ACCEPTED.code, text: 42 },
+      { text: CHIP_KIND_NOT_ACCEPTED.text },
+      "x",
+      null,
+    ];
+    for (const reason of malformed) {
+      const { res, log, event } = await verifyWith(reasonBody(BLOCKED_SOFTWARE_TPM, reason));
+      const label = JSON.stringify(reason);
+      assert.equal(res.status, 403, res.text);
+      assert.equal(res.json.result, `blocked ${DASH} ${SOFTWARE_TPM_WORDS}`, label);
+      assert.ok(!("reason" in event.verdict), `${label}: ${JSON.stringify(event.verdict)}`);
+      assert.deepEqual(log, [BLOCKED_LINE], label);
+      for (const text of [res.text, log.join("\n"), JSON.stringify(event)]) {
+        assert.ok(!text.includes("undefined"), `${label}: ${text}`);
+        assert.ok(!text.includes("[object Object]"), `${label}: ${text}`);
+      }
+    }
+  });
+
+  it("redacts a device id in the reason's result, and keeps it on the console and page", async () => {
+    const reason = { code: CHIP_KIND_NOT_ACCEPTED.code, text: `Seen as ${UEID.toUpperCase()}` };
+    const { res, log, event } = await verifyWith(reasonBody(BLOCKED_SOFTWARE_TPM, reason));
+    assert.equal(res.json.result, `blocked ${DASH} ${SOFTWARE_TPM_WORDS}. Seen as [device id]`);
+    assertNoDeviceIds(res.text);
+    assert.deepEqual(log, [BLOCKED_LINE, `  reason chip_kind_not_accepted: Seen as ${UEID.toUpperCase()}`]);
+    assert.equal(event.verdict.reason.text, reason.text);
+  });
+
+  it("keeps the result and the console reason on one line", async () => {
+    const reason = { code: CHIP_KIND_NOT_ACCEPTED.code, text: "a\r\nb\u0000c" };
+    const { res, log } = await verifyWith(reasonBody(BLOCKED_SOFTWARE_TPM, reason));
+    assert.equal(res.json.result, `blocked ${DASH} ${SOFTWARE_TPM_WORDS}. a b c`);
+    assert.deepEqual(log, [BLOCKED_LINE, "  reason chip_kind_not_accepted: a b c"]);
+  });
+});
+
 // ================================================================ sign
 
 describe("sign", () => {
