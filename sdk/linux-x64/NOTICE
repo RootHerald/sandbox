@@ -1,6 +1,13 @@
 Root Herald and the Root Herald logo are trademarks of Root Herald.
 
-The MIT license in LICENSE applies to the code in this repository. It does
-not grant rights to use the Root Herald trademarks, including the name "Root
-Herald" or any associated logos or designs. Use of those marks is governed
-by separate policy — see https://rootherald.io/brand for details.
+The MIT license in LICENSE applies to the code in this repository, except
+as noted below. It does not grant rights to use the Root Herald trademarks,
+including the name "Root Herald" or any associated logos or designs. Use of
+those marks is governed by separate policy — see https://rootherald.io/brand
+for details.
+
+src/tpm/nitro.c is a C translation of code from NitroTPM Tools
+(https://github.com/aws/NitroTPM-Tools), licensed under the Apache License
+2.0 in LICENSES/Apache-2.0.txt. Its NOTICE reads:
+
+    Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
