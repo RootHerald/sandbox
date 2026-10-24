@@ -142,7 +142,23 @@ device's `ueid` is in no response; the backend's console and its page show it.
 
 A refusal keeps RootHerald's status and carries `error` and `message` as
 RootHerald sent them, with device IDs replaced by `[device id]`. Its `result` is
-`RootHerald refused: <error>`; that prefix is part of the contract. With no key
+`RootHerald refused: <error>`; that prefix is part of the contract.
+
+On an `ek_chain_rejected` refusal, the backend chooses a line from the SDK
+error's `chainFailure`, the field to branch on, never from `message`, and
+appends it to `result` after `. `. The client prints it on its `/enroll/begin`
+line, the backend's console logs it with the kind, and the page shows it as
+Reason. Other kinds get no line.
+
+| `chainFailure` | Line |
+|---|---|
+| `not_trusted` | No maker vouches for this chip's certificate, and this key's policy refuses such chips. |
+| `cert_missing` | This chip sent no readable maker certificate, and this key's policy refuses such chips. |
+| `chain_incomplete` | RootHerald could not link this chip's certificate to a maker it trusts, and this key's policy refuses such chips. |
+| `revoked` | This chip's maker revoked its certificate, and this key's policy refuses revoked chips. |
+| `chain_fetch_failed` | RootHerald could not fetch this chip's certificate chain; run again. |
+
+With no key
 set, every route that calls RootHerald answers 401 `RootHerald refused:
 MISSING_SECRET_KEY`.
 
