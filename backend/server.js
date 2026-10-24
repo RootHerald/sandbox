@@ -49,6 +49,16 @@ const CHIP_WORDS = {
   "mobile-software": "Phone software key",
 };
 
+// A Map, so that a kind named "constructor" or "toString" finds no line.
+/** @type {Map<string, string>} */
+const CHAIN_HINTS = new Map([
+  ["not_trusted", "No maker vouches for this chip's certificate, and this key's policy refuses such chips."],
+  ["cert_missing", "This chip sent no readable maker certificate, and this key's policy refuses such chips."],
+  ["chain_incomplete", "RootHerald could not link this chip's certificate to a maker it trusts, and this key's policy refuses such chips."],
+  ["revoked", "This chip's maker revoked its certificate, and this key's policy refuses revoked chips."],
+  ["chain_fetch_failed", "RootHerald could not fetch this chip's certificate chain; run again."],
+]);
+
 /** @param {unknown} kind */
 function chipWords(kind) {
   return (typeof kind === "string" && Object.hasOwn(CHIP_WORDS, kind) && CHIP_WORDS[kind]) || "Unknown chip";
@@ -103,7 +113,7 @@ function streamEvents(res) {
 // ---------------------------------------------------------------- responses
 
 /**
- * @typedef {{ status: number, body: Record<string, string>, log?: string, sdkCall?: string, sent?: unknown, received?: unknown, verdict?: object }} Outcome
+ * @typedef {{ status: number, body: Record<string, string>, log?: string, sdkCall?: string, sent?: unknown, received?: unknown, verdict?: object, hint?: string }} Outcome
  */
 
 /** @param {number} status @param {string} result @param {Record<string, string>} [extra] */
@@ -132,12 +142,23 @@ function refusal(err) {
   const error = (err instanceof RootHeraldApiError && err.errorCode) || err.code;
   // expected_unknown messages echo the alias the request named.
   const message = err.message.replace(UUID, "[device id]");
-  return {
-    status,
-    body: { result: `RootHerald refused: ${error}`, error, message },
-    log: `refused ${status} ${error}: ${err.message}`,
-    received: { status, error, message: err.message },
-  };
+  let result = `RootHerald refused: ${error}`;
+  let log = `refused ${status} ${error}: ${err.message}`;
+  /** @type {Record<string, unknown>} */
+  const received = { status, error, message: err.message };
+  let hint;
+  // The line is chosen from the kind alone, never from the message text.
+  if (err instanceof RootHeraldApiError && err.chainFailure) {
+    hint = CHAIN_HINTS.get(err.chainFailure);
+    received.chainFailure = err.chainFailure;
+    received.policyCanAdmit = err.policyCanAdmit;
+    log += `\n  chainFailure ${err.chainFailure}`;
+    if (hint) {
+      result += `. ${hint}`;
+      log += `: ${hint}`;
+    }
+  }
+  return { status, body: { result, error, message }, log, received, hint };
 }
 
 // ---------------------------------------------------------------- routes
@@ -448,6 +469,7 @@ async function handle(req, res) {
     status: outcome.status,
     result: outcome.body.result,
     ...(outcome.verdict ? { verdict: outcome.verdict } : {}),
+    ...(outcome.hint ? { hint: outcome.hint } : {}),
   });
   sendJson(res, outcome.status, outcome.body);
 }

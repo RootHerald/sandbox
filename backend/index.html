@@ -98,6 +98,12 @@
     head.append(el("span", new Date(ev.at).toLocaleTimeString()));
     call.append(head);
     if (ev.verdict) call.append(verdictList(ev.verdict));
+    if (ev.hint) {
+      const dl = el("dl");
+      dl.append(el("dt", "Reason"));
+      dl.append(el("dd", ev.hint));
+      call.append(dl);
+    }
     if (ev.sdkCall) call.append(el("div", ev.sdkCall));
     if (ev.sent !== undefined) call.append(details("Sent", ev.sent));
     if (ev.received !== undefined) call.append(details("Received", ev.received));
