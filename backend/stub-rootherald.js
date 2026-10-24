@@ -154,7 +154,16 @@ async function serveStub(port, stateFile) {
   async function answer(route, policy, body) {
     if (route === "/api/v1/attest/enroll") {
       if (policy === "refuse") {
-        return { status: 400, body: { error: "ek_chain_rejected", message: "EK certificate chain did not reach a trusted root" } };
+        // As platform 9cb5b5f8 sends it: AttestationController.cs ChainRefusal.
+        return {
+          status: 400,
+          body: {
+            error: "ek_chain_rejected",
+            message: "EK certificate chain did not reach a trusted root",
+            chainFailure: "not_trusted",
+            policyCanAdmit: true,
+          },
+        };
       }
       const ekPublicArea = Buffer.from(body.ekPublicKey, "base64");
       const akPublicArea = Buffer.from(body.attestationKey.publicArea, "base64");

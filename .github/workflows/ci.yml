@@ -29,6 +29,8 @@ jobs:
           echo "pin=$pin lock=$lock"
           [[ "$pin" =~ ^[0-9] ]]
           test "$pin" = "$lock"
+          contracts=$(jq -r '.packages["node_modules/@rootherald/contracts"].version' backend/package-lock.json)
+          test "$contracts" = "$pin" || { echo "::error::the lock has @rootherald/contracts $contracts, not $pin"; exit 1; }
 
       - name: backend/ holds only its own files
         run: |
@@ -64,6 +66,23 @@ jobs:
           for text in 'Platform or chip not in this policy' 'Unusual boot setup' 'Device not enrolled'; do
             if grep -nF "$text" README.md; then echo "::error::the README quotes a reason's text"; exit 1; fi
           done
+
+      - name: The README carries each chain line and names chainFailure; the page shows the line; no line is picked from message text
+        run: |
+          set -euo pipefail
+          grep -qF 'chainFailure' README.md || { echo "::error::the README does not name chainFailure"; exit 1; }
+          while IFS= read -r line; do
+            grep -qF "$line" README.md || { echo "::error::the README lacks: $line"; exit 1; }
+          done <<'LINES'
+          No maker vouches for this chip's certificate, and this key's policy refuses such chips.
+          This chip sent no readable maker certificate, and this key's policy refuses such chips.
+          RootHerald could not link this chip's certificate to a maker it trusts, and this key's policy refuses such chips.
+          This chip's maker revoked its certificate, and this key's policy refuses revoked chips.
+          RootHerald could not fetch this chip's certificate chain; run again.
+          LINES
+          grep -qF '.hint' backend/index.html || { echo "::error::the page shows no hint"; exit 1; }
+          # A backstop only: the stub cases with a message and no field are the evidence.
+          if grep -nE '\.message\b.*(root|revok|fetch)' backend/server.js; then echo "::error::a line is picked from message text"; exit 1; fi
 
       - name: .env is ignored and .env.example holds a placeholder only
         run: |
@@ -628,7 +647,7 @@ jobs:
           if grep -q '^stopped at ' "$T/unreachable.out"; then fail "an unreachable backend is not a stop by the backend"; fi
           no_state_files || fail "state/ holds $(find client/state -type f)"
 
-      - name: "C11 refused enrollment: step 01's line, exit 2, nothing after, nothing written"
+      - name: "C11 refused enrollment: the refusal and its chain line, exit 2, nothing after, nothing written"
         run: |
           . "$RUNNER_TEMP/scenario.sh"
           fresh_state
@@ -636,7 +655,7 @@ jobs:
           run_client refuse
           stop_backend
           test "$(code refuse)" = 2 || fail "exit $(code refuse), expected 2"
-          grep -qE '^  POST /enroll/begin  RootHerald refused: ek_chain_rejected' "$T/refuse.out" || fail "no refusal line"
+          grep -qxF "  POST /enroll/begin  RootHerald refused: ek_chain_rejected. No maker vouches for this chip's certificate, and this key's policy refuses such chips." "$T/refuse.out" || fail "no refusal line with its chain line"
           grep -qx 'stopped at /enroll/begin' "$T/refuse.out" || fail "no stopped line"
           if grep -E '^  POST /(attest|sign|decrypt)/' "$T/refuse.out"; then fail "a use case ran after the refusal"; fi
           no_state_files || fail "state/ holds $(find client/state -type f)"
@@ -1040,14 +1059,14 @@ jobs:
           done
           docker image tag rh-c22-client rootherald-sandbox-client
 
-      - name: "C23 C11 refused enrollment in the container: step 01's line, exit 2, nothing after, nothing written"
+      - name: "C23 C11 refused enrollment in the container: the refusal and its chain line, exit 2, nothing after, nothing written"
         run: |
           . "$RUNNER_TEMP/container.sh"
           fresh_state
           use_backend refuse
           run_client refuse
           test "$(code refuse)" = 2 || fail "exit $(code refuse), expected 2"
-          grep -qE '^  POST /enroll/begin  RootHerald refused: ek_chain_rejected' "$T/c-refuse.out" || fail "no refusal line"
+          grep -qxF "  POST /enroll/begin  RootHerald refused: ek_chain_rejected. No maker vouches for this chip's certificate, and this key's policy refuses such chips." "$T/c-refuse.out" || fail "no refusal line with its chain line"
           grep -qx 'stopped at /enroll/begin' "$T/c-refuse.out" || fail "no stopped line"
           if grep -E '^  POST /(attest|sign|decrypt)/' "$T/c-refuse.out"; then fail "a use case ran after the refusal"; fi
           test -z "$(state_files)" || fail "state/ holds $(state_files)"

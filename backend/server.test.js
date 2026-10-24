@@ -1332,6 +1332,211 @@ describe("refusals before RootHerald", () => {
   });
 });
 
+// ================================================================ hint
+
+// The refusal body as platform 9cb5b5f8 sends it: AttestationController.cs
+// ChainRefusal, with the kind names of ChainFailureKinds.Wire in
+// RootHerald.Core/Interfaces/IEkValidationService.cs.
+const CHAIN_REFUSED = "RootHerald refused: ek_chain_rejected";
+const CHAIN_MESSAGE = "EK certificate chain did not reach a trusted root";
+const CHAIN_KINDS = [
+  "other",
+  "key_mismatch",
+  "not_trusted",
+  "chain_incomplete",
+  "chain_fetch_failed",
+  "cert_missing",
+  "per_chip_ca_missing",
+  "revoked",
+];
+const CHAIN_HINT_LINES = {
+  not_trusted: "No maker vouches for this chip's certificate, and this key's policy refuses such chips.",
+  cert_missing: "This chip sent no readable maker certificate, and this key's policy refuses such chips.",
+  chain_incomplete: "RootHerald could not link this chip's certificate to a maker it trusts, and this key's policy refuses such chips.",
+  revoked: "This chip's maker revoked its certificate, and this key's policy refuses revoked chips.",
+  chain_fetch_failed: "RootHerald could not fetch this chip's certificate chain; run again.",
+};
+const UNHINTED_KINDS = ["key_mismatch", "per_chip_ca_missing", "other"];
+
+function chainRefusal(chainFailure, policyCanAdmit, { error = "ek_chain_rejected", message = CHAIN_MESSAGE } = {}) {
+  return { status: 400, body: { error, message, chainFailure, policyCanAdmit } };
+}
+
+describe("hint", () => {
+  let stub;
+  let backend;
+  let stream;
+  const answers = [];
+  before(async () => {
+    stub = await startStub();
+    backend = await startBackend({ url: stub.url });
+    stream = openEvents(backend);
+  });
+  after(async () => {
+    stream?.close();
+    await backend?.stop();
+    await stub?.close();
+  });
+
+  // One /enroll/begin answered with refused. A /sign/verify follows it so that
+  // everything the enroll printed has reached the console before the lines are read.
+  async function enrollRefused(refused, kind) {
+    stub.on("/api/v1/attest/enroll", () => refused);
+    const logStart = backend.logs.length;
+    const eventStart = stream.events.length;
+    try {
+      const res = await backend.post("/enroll/begin", ENROLL_BEGIN);
+      await backend.post("/sign/verify", {});
+
+      const marker = "/sign/verify 409 attest first";
+      const deadline = Date.now() + 5000;
+      while (!backend.logs.slice(logStart).includes(marker)) {
+        if (Date.now() > deadline) assert.fail(`no "${marker}" on the console:\n${backend.logs.slice(logStart)}`);
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      const all = lines(backend.logs.slice(logStart));
+      const log = all.slice(all.findIndex((l) => l.startsWith("refused ")), all.indexOf(marker));
+
+      const events = await stream.waitFor((evs) => evs.slice(eventStart).some((e) => e.route === "/sign/verify"));
+      const event = events.slice(eventStart).find((e) => e.route === "/enroll/begin");
+      answers.push({ kind, texts: [res.text, JSON.stringify(event)] });
+      return { res, log, event };
+    } finally {
+      stub.reset();
+    }
+  }
+
+  function assertPlainRefusal({ res, log, event }, label, error = "ek_chain_rejected", message = CHAIN_MESSAGE) {
+    assert.equal(res.status, 400, `${label}: ${res.text}`);
+    assertFlatStrings(res);
+    assert.deepEqual(res.json, { result: `RootHerald refused: ${error}`, error, message }, label);
+    assert.ok(!("hint" in event), `${label}: ${JSON.stringify(event)}`);
+    assert.equal(log[0], `refused 400 ${error}: ${message}`, label);
+  }
+
+  it("the pinned SDK carries chainFailure and policyCanAdmit for every kind, and drops what it does not know", async () => {
+    const contracts = await import("@rootherald/contracts/server");
+    const known = contracts.EK_CHAIN_FAILURE_KINDS;
+    assert.ok(Array.isArray(known), `the pinned @rootherald/contracts/server exports no EK_CHAIN_FAILURE_KINDS (${pinnedNodeVersion()})`);
+    for (const kind of CHAIN_KINDS) assert.ok(known.includes(kind), `EK_CHAIN_FAILURE_KINDS lacks ${kind}: ${known}`);
+
+    const { RootHeraldClient } = await import("@rootherald/node");
+    const rh = new RootHeraldClient({ secretKey: CANARY, baseUrl: stub.url });
+    async function refusedWith(refused) {
+      stub.on("/api/v1/attest/enroll", () => refused);
+      let refusal;
+      try {
+        await rh.relayEnroll(ENROLL_BEGIN);
+      } catch (err) {
+        refusal = err;
+      } finally {
+        stub.reset();
+      }
+      assert.ok(refusal, `relayEnroll did not throw on ${JSON.stringify(refused.body)}`);
+      return refusal;
+    }
+
+    for (const kind of CHAIN_KINDS) {
+      for (const policyCanAdmit of [true, false]) {
+        const err = await refusedWith(chainRefusal(kind, policyCanAdmit));
+        assert.equal(err.chainFailure, kind, `${kind}/${policyCanAdmit}: ${err}`);
+        assert.equal(err.policyCanAdmit, policyCanAdmit, `${kind}/${policyCanAdmit}`);
+      }
+    }
+    const dropped = [
+      chainRefusal("quantum_tunnelled", true),
+      chainRefusal("constructor", true),
+      chainRefusal("not_trusted", true, { error: "ak_template_rejected" }),
+    ];
+    for (const refused of dropped) {
+      const err = await refusedWith(refused);
+      assert.equal(err.chainFailure, undefined, JSON.stringify(refused.body));
+    }
+  });
+
+  for (const [kind, line] of Object.entries(CHAIN_HINT_LINES)) {
+    for (const policyCanAdmit of [true, false]) {
+      it(`${kind} with policyCanAdmit ${policyCanAdmit} ends its result with its line, on the console and the page too`, async () => {
+        const { res, log, event } = await enrollRefused(chainRefusal(kind, policyCanAdmit), kind);
+        assert.equal(res.status, 400, res.text);
+        assertFlatStrings(res);
+        assert.deepEqual(res.json, { result: `${CHAIN_REFUSED}. ${line}`, error: "ek_chain_rejected", message: CHAIN_MESSAGE });
+        assert.deepEqual(log, [`refused 400 ek_chain_rejected: ${CHAIN_MESSAGE}`, `  chainFailure ${kind}: ${line}`]);
+        assert.equal(event.hint, line);
+        assert.equal(event.result, `${CHAIN_REFUSED}. ${line}`);
+        assert.equal(event.received.chainFailure, kind);
+        assert.equal(event.received.policyCanAdmit, policyCanAdmit);
+        assert.equal(event.received.error, "ek_chain_rejected");
+        for (const field of ["run", "group", "route", "status"]) assert.ok(field in event, `event lacks ${field}`);
+      });
+    }
+  }
+
+  for (const kind of UNHINTED_KINDS) {
+    for (const policyCanAdmit of [true, false]) {
+      it(`${kind} with policyCanAdmit ${policyCanAdmit} gets no line, and the console names the kind`, async () => {
+        const answer = await enrollRefused(chainRefusal(kind, policyCanAdmit), kind);
+        assertPlainRefusal(answer, `${kind}/${policyCanAdmit}`);
+        assert.deepEqual(answer.log, [`refused 400 ek_chain_rejected: ${CHAIN_MESSAGE}`, `  chainFailure ${kind}`]);
+        assert.equal(answer.event.received.chainFailure, kind);
+        assert.equal(answer.event.received.policyCanAdmit, policyCanAdmit);
+      });
+    }
+  }
+
+  it("a refusal without the field gets no line, whatever its message names", async () => {
+    const messages = [
+      "untrusted root; the certificate was revoked; intermediate fetch failed",
+      "not_trusted cert_missing chain_incomplete revoked chain_fetch_failed",
+    ];
+    for (const message of messages) {
+      const answer = await enrollRefused({ status: 400, body: { error: "ek_chain_rejected", message } }, undefined);
+      assertPlainRefusal(answer, message, "ek_chain_rejected", message);
+      assert.deepEqual(answer.log, [`refused 400 ek_chain_rejected: ${message}`], message);
+      assert.ok(!("chainFailure" in answer.event.received), JSON.stringify(answer.event.received));
+    }
+  });
+
+  it("a kind the SDK does not carry gets no line", async () => {
+    const cases = [
+      [chainRefusal("quantum_tunnelled", true), "ek_chain_rejected"],
+      [chainRefusal("constructor", true), "ek_chain_rejected"],
+      [chainRefusal("toString", true), "ek_chain_rejected"],
+      [chainRefusal("not_trusted", true, { error: "ak_template_rejected" }), "ak_template_rejected"],
+    ];
+    for (const [refused, error] of cases) {
+      const label = JSON.stringify(refused.body);
+      const answer = await enrollRefused(refused, undefined);
+      assertPlainRefusal(answer, label, error);
+      assert.deepEqual(answer.log, [`refused 400 ${error}: ${CHAIN_MESSAGE}`], label);
+    }
+  });
+
+  it("a hinted refusal still redacts a device id in its message", async () => {
+    const message = `EK of ${UEID} did not reach a trusted root`;
+    const { res, log } = await enrollRefused(chainRefusal("not_trusted", true, { message }), "not_trusted");
+    assert.deepEqual(res.json, {
+      result: `${CHAIN_REFUSED}. ${CHAIN_HINT_LINES.not_trusted}`,
+      error: "ek_chain_rejected",
+      message: "EK of [device id] did not reach a trusted root",
+    });
+    assertNoDeviceIds(res.text);
+    assert.equal(log[0], `refused 400 ek_chain_rejected: ${message}`);
+  });
+
+  it("no line appears in an answer that is not of its kind", () => {
+    assert.ok(answers.length >= 20, `${answers.length} answers`);
+    for (const { kind, texts } of answers) {
+      for (const [lineKind, line] of Object.entries(CHAIN_HINT_LINES)) {
+        if (lineKind === kind) continue;
+        for (const text of texts) {
+          assert.ok(!text.includes(line), `${kind ?? "no kind"} carries the ${lineKind} line: ${text}`);
+        }
+      }
+    }
+  });
+});
+
 // ================================================================ events
 
 describe("events", () => {
